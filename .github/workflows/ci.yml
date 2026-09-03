@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - agent-runtime
+          - rag
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Check lock file
+        run: uv lock --check
+        working-directory: apps/${{ matrix.project }}
+
+      - name: Install dependencies
+        run: uv sync --group dev --locked
+        working-directory: apps/${{ matrix.project }}
+
+      - name: Compile Python sources
+        run: uv run python -m compileall -q . -x '(^|[\\/])\\.venv([\\/]|$)'
+        working-directory: apps/${{ matrix.project }}
+
+      - name: Run Python tests
+        run: |
+          set +e
+          uv run python -m pytest -q
+          status=$?
+          if [ "$status" -eq 5 ]; then
+            echo "No tests found; continuing."
+            exit 0
+          fi
+          exit "$status"
+        working-directory: apps/${{ matrix.project }}
+
+  compose:
+    name: Compose configuration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Prepare local profile template
+        run: cp data/rag/config/application-local.env.example data/rag/config/application-local.env
+
+      - name: Validate Compose configuration
+        run: docker compose --project-directory data/rag --file data/rag/compose.yaml config --quiet
+
+  desktop:
+    name: Electron build
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Electron application
+        run: npm run build
+
+  package-windows:
+    name: Windows installer (tag only)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - python
+      - compose
+      - desktop
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows installer
+        run: npm run package:win
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: buffeed-windows-installer
+          path: apps/desktop/release/*
+          if-no-files-found: error
+          retention-days: 14
