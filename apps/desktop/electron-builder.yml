@@ -1,0 +1,33 @@
+appId: cc.buffeed.desktop
+productName: Buffeed
+icon: assets/buffeed-logo.ico
+directories:
+  output: release
+artifactName: Buffeed-${version}-Setup.${ext}
+npmRebuild: false
+win:
+  signAndEditExecutable: true
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: Buffeed
+files:
+  - out/**
+  - package.json
+extraResources:
+  - from: assets/buffeed-logo.ico
+    to: buffeed-logo.ico
+  - from: ../../apps/agent-runtime
+    to: backend/agent-runtime
+    filter:
+      - "**/*"
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+      - "!**/.pytest_cache/**"
+      - "!**/.env"

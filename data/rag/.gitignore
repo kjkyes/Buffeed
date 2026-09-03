@@ -1,0 +1,12 @@
+.env
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+inputs/
+rag_storage_v154/
+rag_artifacts/
+rag_backups/
+secrets/
+config/application-*.env
+!config/application-*.env.example

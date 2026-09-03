@@ -1,0 +1,180 @@
+# PostgreSQL/pgvector is Alibaba Cloud managed and is intentionally outside this
+# Compose project. Keep NetworkXStorage until the managed instance is confirmed
+# to support Apache AGE; model endpoints are selected through RAG_ACTIVE_PROFILE.
+x-rag-app: &rag-app
+  build:
+    context: ../../apps/rag
+    dockerfile: Dockerfile
+  image: "${RAG_APP_IMAGE:-local-rag:dev}"
+  env_file:
+    - path: config/application.env
+      required: false
+    - path: ${RAG_BASE_ENV_FILE:-.env}
+      required: false
+    - path: ${RAG_PROFILE_ENV_FILE:-config/application-${RAG_ACTIVE_PROFILE:-local}.env}
+      # A selected profile must exist; never silently fall back to legacy .env.
+      required: true
+  networks:
+    - rag-internal
+  security_opt:
+    - no-new-privileges:true
+  init: true
+
+services:
+  docling-serve:
+    image: "${DOCLING_IMAGE:-quay.io/docling-project/docling-serve-cpu@sha256:12b550c3e25fca7ffbba0db602482b11fcf6c400d6a9b628d0c1ba7157dced75}"
+    ports:
+      - "127.0.0.1:${DOCLING_PORT:-5001}:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "false"
+    networks:
+      - rag-internal
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/openapi.json', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 60s
+    restart: unless-stopped
+
+  lightrag:
+    <<: *rag-app
+    command:
+      - python
+      - lightrag_profile_server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9621"
+      - --working-dir
+      - /srv/rag/lightrag
+      - --input-dir
+      - /srv/rag/input
+    environment:
+      RAG_ACTIVE_PROFILE: ${RAG_ACTIVE_PROFILE:-local}
+      HOST: 0.0.0.0
+      PORT: 9621
+      WORKING_DIR: /srv/rag/lightrag
+      INPUT_DIR: /srv/rag/input
+      DOCLING_ENDPOINT: http://docling-serve:5001
+      POSTGRES_APPLICATION_NAME: lightrag
+    expose:
+      - "9621"
+    volumes:
+      - lightrag_working:/srv/rag/lightrag
+      - lightrag_input:/srv/rag/input
+      - ${RAG_SECRETS_HOST_DIR:-./secrets}:/run/secrets:ro
+    depends_on:
+      docling-serve:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9621/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  gateway:
+    <<: *rag-app
+    command:
+      - uvicorn
+      - rag_api:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+      - --workers
+      - "1"
+    environment:
+      RAG_ACTIVE_PROFILE: ${RAG_ACTIVE_PROFILE:-local}
+      RAG_MCP_TRANSPORT: streamable-http
+      RAG_MCP_HOST: 0.0.0.0
+      RAG_MCP_PORT: 8001
+      RAG_INGEST_MODE: container
+      LIGHTRAG_BASE_URL: http://lightrag:9621
+      DOCLING_ENDPOINT: http://docling-serve:5001
+      RAG_INGEST_ROOTS: /srv/rag/ingest
+      RAG_ARTIFACT_ROOT: /srv/rag/artifacts
+      POSTGRES_APPLICATION_NAME: rag-gateway
+    ports:
+      - "127.0.0.1:${RAG_MCP_PORT:-8001}:8001"
+    volumes:
+      - rag_artifacts:/srv/rag/artifacts
+      - ${RAG_INGEST_HOST_DIR:-./inputs}:/srv/rag/ingest:ro
+      - ${RAG_SECRETS_HOST_DIR:-./secrets}:/run/secrets:ro
+    depends_on:
+      docling-serve:
+        condition: service_healthy
+      lightrag:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/v1/rag/ready', timeout=20)"
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  rag-worker:
+    <<: *rag-app
+    command: ["python", "rag_worker.py"]
+    environment:
+      RAG_ACTIVE_PROFILE: ${RAG_ACTIVE_PROFILE:-local}
+      LIGHTRAG_BASE_URL: http://lightrag:9621
+      DOCLING_ENDPOINT: http://docling-serve:5001
+      RAG_ARTIFACT_ROOT: /srv/rag/artifacts
+      RAG_LIGHTRAG_SIDECAR_ROOT: /srv/rag/input
+      RAG_GRAPH_WORKING_DIR: /srv/rag/lightrag
+      RAG_WORKER_ID: ${RAG_WORKER_ID:-rag-worker-1}
+      POSTGRES_APPLICATION_NAME: rag-worker
+    volumes:
+      - rag_artifacts:/srv/rag/artifacts
+      - lightrag_input:/srv/rag/input:ro
+      - lightrag_working:/srv/rag/lightrag:ro
+      - ${RAG_SECRETS_HOST_DIR:-./secrets}:/run/secrets:ro
+    depends_on:
+      lightrag:
+        condition: service_healthy
+    restart: unless-stopped
+
+  rag-migrate:
+    <<: *rag-app
+    profiles: ["ops"]
+    command: ["python", "rag_migrate.py"]
+    environment:
+      RAG_ACTIVE_PROFILE: ${RAG_ACTIVE_PROFILE:-local}
+      POSTGRES_APPLICATION_NAME: rag-migrate
+    volumes:
+      - ${RAG_SECRETS_HOST_DIR:-./secrets}:/run/secrets:ro
+    restart: "no"
+
+  rag-backup:
+    <<: *rag-app
+    profiles: ["ops"]
+    command: ["python", "rag_backup.py"]
+    volumes:
+      - lightrag_working:/srv/rag/lightrag:ro
+      - rag_artifacts:/srv/rag/artifacts:ro
+      - ${RAG_BACKUP_HOST_DIR:-./rag_backups}:/backups
+    restart: "no"
+
+volumes:
+  lightrag_input:
+  lightrag_working:
+  rag_artifacts:
+
+networks:
+  rag-internal:

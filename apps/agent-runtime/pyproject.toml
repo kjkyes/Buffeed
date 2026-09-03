@@ -1,0 +1,24 @@
+[project]
+name = "agent-runtime"
+version = "0.1.0"
+description = "Canonical Buffeed Agent runtime and desktop API."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic==0.116.0",
+    "cos-python-sdk-v5>=1.9.30",
+    "fastapi==0.141.1",
+    "httpx==0.28.1",
+    "mcp==1.28.1",
+    "pydantic==2.13.4",
+    "python-dotenv==1.2.2",
+    "uvicorn==0.50.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv]
+package = false
