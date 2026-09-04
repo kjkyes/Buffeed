@@ -605,7 +605,7 @@ html[data-task-hud-glass="on"] .hud-popover { background: color-mix(in srgb, var
 .team-event-timeline small { overflow: hidden; color: #7a8581; font-size: calc(var(--ui-font-size) - 4px); text-overflow: ellipsis; white-space: nowrap; }
 .team-event-details { display: grid; gap: 7px; border-left: 2px solid #d4e1dd; background: #f8fbfa; padding: 6px 7px; }
 .team-event-details dl { display: grid; gap: 4px; margin: 0; }
-.team-event-detail-row { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 7px; font-size: calc(var(--ui-font-size) - 4px); line-height: 1.35; }
+.team-event-detail-row { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 8px; font-size: calc(var(--ui-font-size) - 4px); line-height: 1.35; }
 .team-event-detail-row dt { color: #8a928e; }
 .team-event-detail-row dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: #4d5b57; }
 .team-event-plan-details { display: grid; gap: 4px; border-top: 1px solid #dfe8e4; padding-top: 6px; color: #4d5b57; font-size: calc(var(--ui-font-size) - 4px); line-height: 1.35; }
