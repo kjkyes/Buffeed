@@ -355,6 +355,9 @@ export function useAgentWorkspace({
       }
     }
     const assistantPhase = String(streamEvent.payload.phase ?? "final");
+    if (streamEvent.type === "assistant.message" && assistantPhase === "final") {
+      setTraceExpanded(false);
+    }
     const streamId = String(streamEvent.payload.stream_id ?? "").trim();
     const streamRetracted = streamEvent.payload.stream_retracted === true;
     if (
@@ -429,6 +432,7 @@ export function useAgentWorkspace({
       setTurnFinishedAt(streamEvent.createdAt ?? Date.now() / 1000);
       setActiveTurnId(null);
       setTurnSubmitting(false);
+      setTraceExpanded(false);
       void refreshSessions();
     }
   }, [activeSessionId, activeTurnId, onTeamEvent, refreshSessions]);
@@ -450,6 +454,7 @@ export function useAgentWorkspace({
     setTurnFinishedAt(terminalEvent.createdAt ?? Date.now() / 1000);
     setActiveTurnId(null);
     setTurnSubmitting(false);
+    setTraceExpanded(false);
     void refreshSessions();
   }, [events, refreshSessions]);
 

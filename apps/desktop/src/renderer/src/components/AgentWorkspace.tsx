@@ -34,6 +34,7 @@ import type { TurnModel, TurnModelOption } from "../services/agentApi";
 import logoUrl from "../assets/buffeed-logo.png";
 
 type AgentWorkspaceProps = {
+  theme: "light" | "dark";
   agentApi: string;
   activeSession: Session | null;
   sessions: Session[];
@@ -82,6 +83,7 @@ type AgentWorkspaceProps = {
 
 const COMPOSER_MIN_HEIGHT = 48;
 const COMPOSER_AUTO_MAX_HEIGHT = 128;
+const COMPOSER_HEIGHT_STORAGE_KEY = "buffeed.composer-height";
 const MESSAGE_BOTTOM_THRESHOLD = 24;
 
 type ComposerResizeState = {
@@ -225,6 +227,7 @@ function UserMessage({
 }
 
 export function AgentWorkspace({
+  theme,
   agentApi,
   activeSession,
   sessions,
@@ -274,6 +277,7 @@ export function AgentWorkspace({
   const attachmentTriggerRef = useRef<HTMLButtonElement>(null);
   const modelTriggerRef = useRef<HTMLButtonElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
+  const composerContainerRef = useRef<HTMLElement>(null);
   const turnRefs = useRef(new Map<string, HTMLDivElement>());
   const composerResizeRef = useRef<ComposerResizeState | null>(null);
   const composerManualHeightRef = useRef(false);
@@ -309,6 +313,13 @@ export function AgentWorkspace({
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [expandedAttachment]);
+
+  useEffect(() => {
+    const backgroundColor = expandedAttachment
+      ? theme === "dark" ? "#131615" : "#555957"
+      : theme === "dark" ? "#171716" : "#f7f7f5";
+    void window.desktop?.setWindowTheme(theme, backgroundColor);
+  }, [expandedAttachment, theme]);
 
   const openMediaPreview = useCallback((attachment: { name: string; kind: "image" | "video"; path?: string; previewUrl: string }) => {
     const path = attachment.path;
@@ -403,14 +414,27 @@ export function AgentWorkspace({
     if (!resizeState || resizeState.pointerId !== event.pointerId) {
       return;
     }
+    const textarea = composerRef.current;
     composerResizeRef.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
+    if (textarea) {
+      window.localStorage.setItem(COMPOSER_HEIGHT_STORAGE_KEY, String(Math.round(textarea.getBoundingClientRect().height)));
+    }
   }, []);
 
   useEffect(() => {
-    if (!prompt && composerRef.current) {
+    const textarea = composerRef.current;
+    if (!textarea) return;
+    const storedHeight = Number(window.localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY));
+    if (!Number.isFinite(storedHeight) || storedHeight <= 0) return;
+    setComposerHeight(textarea, storedHeight);
+    composerManualHeightRef.current = true;
+  }, [activeSessionId, setComposerHeight]);
+
+  useEffect(() => {
+    if (!prompt && composerRef.current && !composerManualHeightRef.current) {
       resizeComposer(composerRef.current, false);
       setSessionMentionQuery(null);
     }
@@ -455,6 +479,23 @@ export function AgentWorkspace({
       mutationObserver.disconnect();
     };
   }, [activeSessionId, updateScrollToBottomVisibility]);
+
+  useEffect(() => {
+    const messagesElement = messagesRef.current;
+    const composerElement = composerContainerRef.current;
+    if (!messagesElement || !composerElement) return undefined;
+    const syncComposerSpace = () => {
+      const reservedHeight = Math.ceil(composerElement.getBoundingClientRect().height + 24);
+      messagesElement.style.setProperty("--composer-reserved-height", `${reservedHeight}px`);
+    };
+    const observer = new ResizeObserver(syncComposerSpace);
+    observer.observe(composerElement);
+    syncComposerSpace();
+    return () => {
+      observer.disconnect();
+      messagesElement.style.removeProperty("--composer-reserved-height");
+    };
+  }, [activeSessionId]);
 
   const handleEditSteer = useCallback(() => {
     onEditSteer();
@@ -653,6 +694,7 @@ export function AgentWorkspace({
                 [group.turnId as string]: !(current[group.turnId as string] ?? false),
               }))
             : () => undefined;
+          const assistantMessages = group.messages.filter((message) => message.role !== "user");
           return (
             <div
               className="message-group"
@@ -695,11 +737,22 @@ export function AgentWorkspace({
                   onToggle={toggleTraceForTurn}
                 />
               )}
-              {group.messages.filter((message) => message.role !== "user").map((message) => (
+              {assistantMessages.map((message, assistantIndex) => (
                 <article className={`message ${message.role} ${isLatestTurn ? "latest-turn" : ""}`} key={message.id}>
                   <div className="message-content">
                     <MarkdownContent text={message.text} />
                   </div>
+                  {group.turnId && group.turnId !== activeTurnId && assistantIndex === assistantMessages.length - 1 && taskHUDByTurn[group.turnId]?.summary && (
+                    <div className="message-summary-hud">
+                      <TaskHUD
+                        state={taskHUDByTurn[group.turnId]}
+                        variant="summary"
+                        enabled
+                        onRevert={onRevertChanges}
+                        onReview={(path) => onReviewChanges(group.turnId ?? undefined, path)}
+                      />
+                    </div>
+                  )}
                   {(!group.turnId || group.turnId !== activeTurnId) && (
                     <div className="message-copy-row message-copy-row-assistant assistant-action-row">
                       <CopyButton text={message.text} label="复制回复" className="message-copy-button" />
@@ -719,17 +772,6 @@ export function AgentWorkspace({
                   )}
                 </article>
               ))}
-              {group.turnId && group.turnId !== activeTurnId && taskHUDByTurn[group.turnId]?.summary && (
-                <div className="message-summary-hud">
-                  <TaskHUD
-                    state={taskHUDByTurn[group.turnId]}
-                    variant="summary"
-                    enabled
-                    onRevert={onRevertChanges}
-                    onReview={(path) => onReviewChanges(group.turnId ?? undefined, path)}
-                  />
-                </div>
-              )}
             </div>
           );
           })}
@@ -771,7 +813,7 @@ export function AgentWorkspace({
         )}
       </div>
 
-      <footer className="composer">
+      <footer ref={composerContainerRef} className="composer">
         <div className="composer-task-hud">
           <TaskHUD
             state={taskHUD}
@@ -934,7 +976,7 @@ export function AgentWorkspace({
           role="dialog"
           aria-modal="true"
           aria-label="媒体附件预览"
-          onMouseDown={(event) => {
+          onClick={(event) => {
             if (event.target === event.currentTarget) setExpandedAttachment(null);
           }}
         >

@@ -151,6 +151,25 @@ function formatInput(event: PersistedStreamEvent): string | undefined {
   return `${event.event_type}\n${JSON.stringify(input, null, 2)}`;
 }
 
+const PREVIEW_INPUT_LIMIT = 400;
+const PREVIEW_OUTPUT_LIMIT = 800;
+const PREVIEW_READ_OUTPUT_LIMIT = 600;
+
+function previewLimit(operation: HUDOperation, kind: "input" | "output"): number {
+  if (kind === "input") return PREVIEW_INPUT_LIMIT;
+  const toolName = operation.toolName.toLowerCase();
+  return ["load_skill", "read_file", "read"].includes(toolName)
+    ? PREVIEW_READ_OUTPUT_LIMIT
+    : PREVIEW_OUTPUT_LIMIT;
+}
+
+function clipPreview(value: string | undefined, limit: number): string | undefined {
+  if (!value) return value;
+  if (value.length <= limit) return value;
+  const suffix = `\n... (preview truncated, ${value.length} chars total)`;
+  return `${value.slice(0, Math.max(0, limit - suffix.length))}${suffix}`;
+}
+
 async function fetchOperationDetail(
   operation: HUDOperation,
   baseUrl: string,
@@ -173,8 +192,8 @@ async function fetchOperationDetail(
       outputs.push(String(event.payload.output ?? ""));
     }
   }
-  if (inputs.length > 0) detail.input = inputs.join("\n\n");
-  if (outputs.length > 0) detail.output = outputs.join("\n\n");
+  if (inputs.length > 0) detail.input = clipPreview(inputs.join("\n\n"), previewLimit(operation, "input"));
+  if (outputs.length > 0) detail.output = clipPreview(outputs.join("\n\n"), previewLimit(operation, "output"));
   return detail;
 }
 
@@ -233,8 +252,14 @@ export function AgentOperationCard({ operations, baseUrl, sessionId }: AgentOper
           {operations.map((operation) => {
             const entryOpen = Boolean(openEntryIds[operation.id]);
             const detail = details[operation.id];
-            const input = detail?.input ?? operation.inputSummary;
-            const output = detail?.output ?? operation.detail;
+            const input = clipPreview(
+              detail?.input ?? operation.inputSummary,
+              previewLimit(operation, "input"),
+            );
+            const output = clipPreview(
+              detail?.output ?? operation.detail,
+              previewLimit(operation, "output"),
+            );
             return (
               <div className="trace-operation-entry" key={operation.id}>
                 <button

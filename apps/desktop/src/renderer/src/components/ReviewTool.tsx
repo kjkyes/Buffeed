@@ -1,4 +1,4 @@
-import { ClipboardCheck, FileCode2, GitBranch } from "lucide-react";
+import { ClipboardCheck, FileCode2, GitBranch, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import type { HUDFileChange } from "../domains/hud";
@@ -29,6 +29,7 @@ function DiffLines({ file }: { file: HUDFileChange }) {
 export function ReviewTool({ workspace, files, turnId, selectedPath: requestedPath }: ReviewToolProps) {
   const [query, setQuery] = useState("");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [metadataVisible, setMetadataVisible] = useState(true);
   const filteredFiles = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     return normalized ? files.filter((file) => file.path.toLowerCase().includes(normalized)) : files;
@@ -44,21 +45,31 @@ export function ReviewTool({ workspace, files, turnId, selectedPath: requestedPa
     <div className="review-tool">
       <header className="tool-header review-tool-header">
         <div><span className="eyebrow">工具插件</span><h2><ClipboardCheck size={16} /> 改动审核</h2></div>
-        <span className="review-tool-count">{files.length} 个文件</span>
+        <button
+          className="icon-button"
+          type="button"
+          title={metadataVisible ? "隐藏文件区" : "显示文件区"}
+          aria-label={metadataVisible ? "隐藏文件区" : "显示文件区"}
+          aria-pressed={metadataVisible}
+          onClick={() => setMetadataVisible((visible) => !visible)}
+        >
+          {metadataVisible ? <PanelRightClose size={16} /> : <PanelRightOpen size={16} />}
+        </button>
       </header>
-      <div className="review-tool-body">
+      <div className={`review-tool-body ${metadataVisible ? "" : "is-sidebar-hidden"}`}>
         <section className="review-code-panel" aria-label="改动代码">
           {selectedFile ? <><div className="review-file-heading"><FileCode2 size={14} /><strong title={selectedFile.path}>{selectedFile.path}</strong><span><b className="hud-additions">+{selectedFile.additions}</b> <b className="hud-deletions">-{selectedFile.deletions}</b></span></div><DiffLines file={selectedFile} /></> : <p className="review-empty">该回合没有可展示的文件改动</p>}
         </section>
-        <aside className="review-file-panel" aria-label="改动文件筛选">
+        {metadataVisible && <aside className="review-file-panel" aria-label="改动文件筛选">
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="筛选文件..." aria-label="筛选改动文件" />
           <div className="review-file-list">
             {filteredFiles.map((file) => <button className={file.path === selectedFile?.path ? "is-active" : ""} type="button" key={file.path} onClick={() => setSelectedPath(file.path)}><span title={file.path}>{file.path}</span><small><b className="hud-additions">+{file.additions}</b> <b className="hud-deletions">-{file.deletions}</b></small></button>)}
             {!filteredFiles.length && <p className="review-empty">没有匹配文件</p>}
           </div>
-        </aside>
+          <div className="review-file-count">{files.length} 个文件</div>
+        </aside>}
       </div>
-      <footer className="review-worktree"><GitBranch size={14} /><span>worktree</span><code title={workspace || "未选择工作区"}>{workspace || "未选择工作区"}</code></footer>
+      {metadataVisible && <footer className="review-worktree"><GitBranch size={14} /><span>worktree</span><code title={workspace || "未选择工作区"}>{workspace || "未选择工作区"}</code></footer>}
     </div>
   );
 }

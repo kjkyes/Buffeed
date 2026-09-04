@@ -60,11 +60,18 @@ function DiffPreview({ file }: { file: HUDFileChange }) {
   );
 }
 
+function estimateDiffPreviewHeight(file: HUDFileChange): number {
+  const lineCount = file.diffLines?.length || file.hunks.length;
+  const diffHeight = lineCount > 0 ? Math.min(300, Math.max(22, lineCount * 15)) : 24;
+  return diffHeight + 58;
+}
+
 export function TaskHUD({ state, variant = "running", enabled, onRevert, onReview }: TaskHUDProps) {
   const [stepsOpen, setStepsOpen] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
-  const [previewPlacement, setPreviewPlacement] = useState<"above" | "below">("above");
+  const [previewTop, setPreviewTop] = useState<number | null>(null);
+  const [previewPlacement, setPreviewPlacement] = useState<"above" | "below">("below");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [showAllFiles, setShowAllFiles] = useState(false);
 
@@ -80,10 +87,24 @@ export function TaskHUD({ state, variant = "running", enabled, onRevert, onRevie
   const displayCurrentStep = state.totalSteps > 0 ? state.currentStep : terminal ? 1 : 0;
 
   const handleFileHover = (event: MouseEvent<HTMLButtonElement>, path: string) => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const topSpace = rect.top;
-    const bottomSpace = window.innerHeight - rect.bottom;
-    setPreviewPlacement(topSpace < 260 && bottomSpace >= topSpace ? "below" : "above");
+    const fileRect = event.currentTarget.getBoundingClientRect();
+    const region = event.currentTarget.closest<HTMLElement>(".hud-summary-files-hover-region");
+    if (region) {
+      const regionRect = region.getBoundingClientRect();
+      const file = state.fileChanges.find((item) => item.path === path);
+      const previewHeight = file ? estimateDiffPreviewHeight(file) : 320;
+      const conversation = event.currentTarget.closest<HTMLElement>(".messages");
+      const conversationRect = conversation?.getBoundingClientRect();
+      const topBoundary = conversationRect?.top ?? 0;
+      const bottomBoundary = conversationRect?.bottom ?? window.innerHeight;
+      const spaceAbove = Math.max(0, fileRect.top - topBoundary);
+      const spaceBelow = Math.max(0, bottomBoundary - fileRect.bottom);
+      const placeAbove = spaceBelow < previewHeight && spaceAbove > spaceBelow;
+      setPreviewPlacement(placeAbove ? "above" : "below");
+      setPreviewTop(placeAbove
+        ? fileRect.top - regionRect.top - previewHeight - 5
+        : fileRect.bottom - regionRect.top + 5);
+    }
     setSelectedPath(path);
   };
 
@@ -121,7 +142,7 @@ export function TaskHUD({ state, variant = "running", enabled, onRevert, onRevie
         </div>
         <div className="hud-summary-files-hover-region" onMouseLeave={() => setSelectedPath(null)}>
           {selectedFile && (
-            <div className={`hud-diff-preview hud-diff-preview-hover placement-${previewPlacement}`}>
+            <div className={`hud-diff-preview hud-diff-preview-hover placement-${previewPlacement}`} style={{ top: previewTop ?? 0 }}>
               <div className="hud-diff-preview-heading"><FileCode2 size={13} /><strong>{selectedFile.path}</strong></div>
               <DiffPreview file={selectedFile} />
             </div>
@@ -182,7 +203,7 @@ export function TaskHUD({ state, variant = "running", enabled, onRevert, onRevie
           onFocus={() => setFilesOpen(true)}
           onBlur={() => setFilesOpen(false)}
         >
-          <button className="hud-summary-button" type="button" onClick={() => setFilesOpen((value) => !value)}>
+          <button className="hud-summary-button" type="button" onClick={() => void onReview()}>
             {state.summary?.totalFiles ?? 0} 个文件已更改
           </button>
           {state.summary && (

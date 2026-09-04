@@ -5,6 +5,16 @@ export function timeLabel(timestamp: number): string {
   }).format(new Date(timestamp * 1000));
 }
 
+export function dateTimeLabel(timestamp: number): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(timestamp * 1000));
+}
+
 export function turnTimeLabel(timestamp: number): string {
   return new Intl.DateTimeFormat("zh-CN", {
     weekday: "long",

@@ -166,6 +166,7 @@ export default function App() {
       )}
       agentWorkspace={(
         <AgentWorkspace
+          theme={theme}
           agentApi={agent.agentApi}
           activeSession={agent.activeSession}
           sessions={agent.sessions}

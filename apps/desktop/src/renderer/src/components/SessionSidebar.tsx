@@ -1,7 +1,8 @@
 import { ChevronRight, FolderOpen, Settings, Sparkles } from "lucide-react";
+import { useState } from "react";
 
 import type { Session } from "../domains/agent";
-import { timeLabel } from "../utils/format";
+import { dateTimeLabel, timeLabel } from "../utils/format";
 
 type SessionSidebarProps = {
   workspace: string;
@@ -35,6 +36,7 @@ export function SessionSidebar({
   const projectGroups = [...projects.entries()].sort(
     ([, left], [, right]) => (right[0]?.updated_at ?? 0) - (left[0]?.updated_at ?? 0),
   );
+  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
 
   return (
     <aside className="sidebar">
@@ -53,28 +55,41 @@ export function SessionSidebar({
       <nav className="session-list" aria-label="会话列表">
         <div className="section-label">会话</div>
         {sessions.length === 0 && <p className="empty-copy">没有会话</p>}
-        {projectGroups.map(([projectPath, projectSessions]) => {
+        {projectGroups.map(([projectPath, projectSessions], index) => {
           const projectName = projectPath.split(/[\\/]/).filter(Boolean).pop() ?? projectPath;
+          const collapsed = collapsedProjects[projectPath] === true;
+          const sessionsId = `project-sessions-${index}`;
           return (
             <section className="project-session-group" key={projectPath}>
-              <div className="project-session-heading" title={projectPath}>
+              <button
+                className="project-session-heading"
+                type="button"
+                title={projectPath}
+                aria-expanded={!collapsed}
+                aria-controls={sessionsId}
+                onClick={() => setCollapsedProjects((current) => ({ ...current, [projectPath]: !collapsed }))}
+              >
                 <FolderOpen size={14} />
                 <span>{projectName}</span>
                 <small>{projectSessions.length}</small>
-              </div>
-              {projectSessions.map((session) => (
-                <button
-                  key={session.session_id}
-                  className={`session-item ${session.session_id === activeSessionId ? "selected" : ""}`}
-                  onClick={() => void onSelectSession(session)}
-                >
-                  <span className={`status-dot ${session.status}`} />
-                  <span>
-                    <strong title={session.session_id}>{session.title || session.session_id.slice(0, 8)}</strong>
-                    <small>{timeLabel(session.updated_at)}</small>
-                  </span>
-                </button>
-              ))}
+              </button>
+              {!collapsed && (
+                <div id={sessionsId}>
+                  {projectSessions.map((session) => (
+                    <button
+                      key={session.session_id}
+                      className={`session-item ${session.session_id === activeSessionId ? "selected" : ""}`}
+                      onClick={() => void onSelectSession(session)}
+                    >
+                      <span className={`status-dot ${session.status}`} />
+                      <span>
+                        <strong title={dateTimeLabel(session.updated_at)}>{session.title || session.session_id.slice(0, 8)}</strong>
+                        <small>{timeLabel(session.updated_at)}</small>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </section>
           );
         })}
