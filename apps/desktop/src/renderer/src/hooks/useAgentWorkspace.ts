@@ -64,6 +64,12 @@ function eventOrder(event: StreamEvent): number {
 const FOLDED_LIFECYCLE_EVENTS = new Set(["model.requested", "turn.completed"]);
 // Runtime restoration and first-use model setup can exceed the normal request latency.
 const TURN_SUBMIT_TIMEOUT_MS = 20_000;
+const ATTACHMENT_CONTEXT_MARKER = "[附件上下文]";
+
+function displayQuery(query: string): string {
+  const markerIndex = query.indexOf(`\n\n${ATTACHMENT_CONTEXT_MARKER}`);
+  return markerIndex >= 0 ? query.slice(0, markerIndex).trim() : query;
+}
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException
@@ -278,6 +284,7 @@ export function useAgentWorkspace({
     if (streamEvent.type === "turn.queued" || streamEvent.type === "turn.started") {
       const isStarted = streamEvent.type === "turn.started";
       const query = String(streamEvent.payload.query ?? "");
+      const visibleQuery = displayQuery(query);
       const pending = pendingTurnRef.current;
       const canAdoptPending = Boolean(
         pending
@@ -336,7 +343,7 @@ export function useAgentWorkspace({
           {
             id: streamEvent.event_id,
             role: "user",
-            text: query,
+            text: visibleQuery,
             turnId: streamEvent.turnId,
             attachments: eventAttachments,
           } satisfies ChatMessage,
@@ -590,7 +597,7 @@ export function useAgentWorkspace({
     }
     const requestId = crypto.randomUUID();
     const pendingAttachments = attachments;
-    const originalPrompt = prompt;
+    const originalPrompt = prompt.trim();
     const clientTurnId = `client:${requestId}`;
     pendingTurnRef.current = {
       clientTurnId,
@@ -610,7 +617,7 @@ export function useAgentWorkspace({
       {
         id: clientTurnId,
         role: "user",
-        text: query,
+        text: originalPrompt,
         turnId: null,
         attachments: pendingAttachments.map((item) => ({
           name: item.name,
