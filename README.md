@@ -125,7 +125,6 @@ $env:BUFFEED_HOME="D:\buffeed_data\.buffeed"
 - 不要删除 `BUFFEED_HOME\state`，其中包含会话、运行状态等数据
 - 二次开发时不要将 `.env`、API 密钥、COS 密钥、RAG 输入数据、知识库和本地附件提交到远程仓库
 - 安装目录不建议作为项目工作区，推荐使用独立的用户项目目录
-```
 
 
 ### 启动桌面工作台
