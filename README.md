@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="apps/desktop/assets/buffeed-logo.png" width="112" alt="Buffeed logo" />
+  <img src="assets/buffeed-logo.png" width="112" alt="Buffeed logo" />
   <h1>Buffeed</h1>
   <p><strong>把 AI Agent、项目上下文与知识库带回同一个本地工作台。</strong></p>
   <p>面向开发与知识工作的桌面应用，帮助你从一个目标出发，组织执行、观察过程，并获得可追溯的结果。</p>
