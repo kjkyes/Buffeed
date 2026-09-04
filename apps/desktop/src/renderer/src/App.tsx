@@ -82,8 +82,21 @@ export default function App() {
     root.style.setProperty("--app-accent-soft", `hsl(${hue} ${Math.max(0, saturation - 18)}% ${softLightness}%)`);
     root.style.setProperty("--send-bg", `hsl(${hue} ${saturation}% ${Math.max(26, lightness - 10)}%)`);
     root.style.setProperty("--send-hover", `hsl(${hue} ${saturation}% ${Math.max(32, lightness)}%)`);
-    void window.desktop?.setWindowTheme(theme, dark ? "#20201f" : "#f7f7f5");
+    void window.desktop?.setWindowTheme(theme, dark ? "#171716" : "#f7f7f5");
   }, [accentLightness, codeFont, codeFontSize, layoutScale, palette, taskHudGlass, theme, uiFont, uiFontSize]);
+
+  useEffect(() => {
+    const titleBar = document.querySelector<HTMLElement>(".app-toolbar, .settings-header");
+    if (!titleBar) return undefined;
+    const syncTitleBarHeight = () => {
+      const devicePixelRatio = window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
+      void window.desktop?.setTitleBarOverlayHeight(titleBar.getBoundingClientRect().height / devicePixelRatio);
+    };
+    const observer = new ResizeObserver(syncTitleBarHeight);
+    observer.observe(titleBar);
+    syncTitleBarHeight();
+    return () => observer.disconnect();
+  }, [pluginsOpen, settingsOpen]);
 
   useEffect(() => {
     if (team.teamObservation?.available) setToolPanelVisible(true);

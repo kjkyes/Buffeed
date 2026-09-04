@@ -64,7 +64,8 @@ export function SettingsPage({ theme, palette, accentLightness, uiFont, codeFont
         <button className="icon-button" type="button" title="返回工作区" aria-label="返回工作区" onClick={onBack}><ArrowLeft size={18} /></button>
         <div className="settings-title"><Settings size={18} /><div><span className="eyebrow">Buffeed</span><h1>外观设置</h1></div></div>
       </header>
-      <div className="settings-body">
+      <div className="settings-scroll-region">
+        <div className="settings-body">
         <section className="settings-section">
           <h2>主题</h2>
           <div className="settings-choice-grid">
@@ -135,6 +136,7 @@ export function SettingsPage({ theme, palette, accentLightness, uiFont, codeFont
           </button>
           <p className="settings-note">关闭后使用不透明背景。</p>
         </section>
+        </div>
       </div>
     </main>
   );

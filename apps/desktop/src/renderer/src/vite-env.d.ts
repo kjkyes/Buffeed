@@ -13,6 +13,7 @@ interface Window {
     stageRagFile: () => Promise<{ gatewayPath: string; name: string } | null>;
     apiBaseUrl: () => Promise<string>;
     setWindowTheme: (theme: "light" | "dark", backgroundColor: string) => Promise<void>;
+    setTitleBarOverlayHeight: (height: number) => Promise<void>;
     openSessionWindow: (sessionId: string) => Promise<void>;
     openRagManager: () => Promise<void>;
     selectPreviewFile: () => Promise<{
@@ -67,7 +68,7 @@ interface Window {
         tabs: Array<{ id: string; url: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean }>;
         activeTabId: string | null;
       }>;
-      setBounds: (bounds: { x: number; y: number; width: number; height: number }) => void;
+      setBounds: (bounds: { x: number; y: number; width: number; height: number; viewportWidth: number; viewportHeight: number }) => void;
       onState: (listener: (state: {
         url: string;
         title: string;

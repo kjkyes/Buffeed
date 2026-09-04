@@ -25,6 +25,8 @@ let browserBounds: BrowserBounds | undefined;
 let browserBridgeToken = randomUUID();
 let browserBridgeServer: ReturnType<typeof createServer> | undefined;
 let isQuitting = false;
+let titleBarOverlayHeight = 36;
+let titleBarSymbolColor = "#262622";
 type TerminalSession = { id: string; cwd: string; process: pty.IPty };
 const terminalSessions = new Map<string, TerminalSession>();
 
@@ -196,8 +198,20 @@ function applyWindowTheme(theme: "light" | "dark", backgroundColor: string): voi
   if (!/^#[0-9a-f]{6}$/i.test(backgroundColor)) throw new Error("无效的窗口颜色");
   nativeTheme.themeSource = theme;
   windowBackgroundColor = backgroundColor;
+  titleBarSymbolColor = theme === "dark" ? "#ecece8" : "#262622";
   for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.setBackgroundColor(backgroundColor);
+    if (window.isDestroyed()) continue;
+    window.setBackgroundColor(backgroundColor);
+    window.setTitleBarOverlay({ color: backgroundColor, symbolColor: titleBarSymbolColor, height: titleBarOverlayHeight });
+  }
+}
+
+function setTitleBarOverlayHeight(height: number): void {
+  if (!Number.isFinite(height) || height < 20 || height > 100) throw new Error("无效的标题栏高度");
+  titleBarOverlayHeight = Math.round(height);
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed()) continue;
+    window.setTitleBarOverlay({ color: windowBackgroundColor, symbolColor: titleBarSymbolColor, height: titleBarOverlayHeight });
   }
 }
 
@@ -219,6 +233,7 @@ type EditorInfo = {
 };
 
 type BrowserBounds = { x: number; y: number; width: number; height: number };
+type BrowserBoundsPayload = BrowserBounds & { viewportWidth: number; viewportHeight: number };
 
 function looksLikeCorruptedText(text: string): boolean {
   if (text.includes("\uFFFD")) return true;
@@ -267,16 +282,22 @@ function assertBrowserBounds(value: unknown): BrowserBounds {
   if (!value || typeof value !== "object") {
     throw new Error("无效的浏览器面板尺寸");
   }
-  const bounds = value as Partial<BrowserBounds>;
-  const numbers = [bounds.x, bounds.y, bounds.width, bounds.height];
+  const bounds = value as Partial<BrowserBoundsPayload>;
+  const numbers = [bounds.x, bounds.y, bounds.width, bounds.height, bounds.viewportWidth, bounds.viewportHeight];
   if (numbers.some((item) => typeof item !== "number" || !Number.isFinite(item))) {
     throw new Error("无效的浏览器面板尺寸");
   }
+  if (bounds.viewportWidth! <= 0 || bounds.viewportHeight! <= 0) {
+    throw new Error("无效的浏览器面板尺寸");
+  }
+  const contentBounds = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getContentBounds() : undefined;
+  const scaleX = contentBounds ? contentBounds.width / bounds.viewportWidth! : 1;
+  const scaleY = contentBounds ? contentBounds.height / bounds.viewportHeight! : 1;
   return {
-    x: Math.max(0, Math.round(bounds.x!)),
-    y: Math.max(0, Math.round(bounds.y!)),
-    width: Math.max(1, Math.round(bounds.width!)),
-    height: Math.max(1, Math.round(bounds.height!)),
+    x: Math.max(0, Math.round(bounds.x! * scaleX)),
+    y: Math.max(0, Math.round(bounds.y! * scaleY)),
+    width: Math.max(1, Math.round(bounds.width! * scaleX)),
+    height: Math.max(1, Math.round(bounds.height! * scaleY)),
   };
 }
 
@@ -507,9 +528,9 @@ function createWindow(): void {
     show: false,
     titleBarStyle: "hidden",
     titleBarOverlay: {
-      color: "#20201f",
-      symbolColor: "#ecece8",
-      height: 36,
+      color: windowBackgroundColor,
+      symbolColor: titleBarSymbolColor,
+      height: titleBarOverlayHeight,
     },
     title: "Buffeed",
     icon: appIconPath(),
@@ -549,9 +570,9 @@ function openSessionWindow(sessionId: string): void {
     minHeight: 720,
     titleBarStyle: "hidden",
     titleBarOverlay: {
-      color: "#20201f",
-      symbolColor: "#ecece8",
-      height: 36,
+      color: windowBackgroundColor,
+      symbolColor: titleBarSymbolColor,
+      height: titleBarOverlayHeight,
     },
     title: "Buffeed",
     icon: appIconPath(),
@@ -1427,6 +1448,9 @@ app.whenReady().then(async () => {
   ipcMain.handle("desktop:api-base-url", desktopApiBaseUrl);
   ipcMain.handle("desktop:set-window-theme", (_event, theme: "light" | "dark", backgroundColor: string) => {
     applyWindowTheme(theme, backgroundColor);
+  });
+  ipcMain.handle("desktop:set-titlebar-overlay-height", (_event, height: number) => {
+    setTitleBarOverlayHeight(height);
   });
   ipcMain.handle("desktop:open-session-window", (_event, sessionId: string) => {
     if (!sessionId || sessionId.length > 128) throw new Error("无效的会话 ID");

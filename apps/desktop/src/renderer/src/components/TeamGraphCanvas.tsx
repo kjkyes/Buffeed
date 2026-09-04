@@ -24,11 +24,24 @@ type TeamFlowNode = Node<TeamFlowNodeData, "team">;
 type TeamFlowEdge = Edge<{ kind: string }>;
 
 const elk = new ELK();
-const NODE_HEIGHT = 86;
+const BASE_NODE_HEIGHT = 86;
 const NODE_WIDTHS: Record<ExecutionIRNode["kind"], number> = {
   member: 224,
   task: 334,
 };
+
+function teamNodeMetrics(fontScale: number) {
+  return {
+    height: Math.round(BASE_NODE_HEIGHT * fontScale),
+    nodeGap: Math.round(28 * fontScale),
+    edgeGap: Math.round(28 * fontScale),
+  };
+}
+
+function currentUiFontScale(): number {
+  const value = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ui-font-size"));
+  return Number.isFinite(value) ? Math.min(20, Math.max(12, value)) / 14 : 1;
+}
 
 function statusLabel(status: string): string {
   const labels: Record<string, string> = {
@@ -103,7 +116,11 @@ function edgeStyle(kind: string): { stroke: string; strokeDasharray?: string } {
   return { stroke: "#87939a", strokeDasharray: "1 4" };
 }
 
-function buildElkGraph(execution: ExecutionIR, nodeIds: Set<string>): Parameters<typeof elk.layout>[0] {
+function buildElkGraph(
+  execution: ExecutionIR,
+  nodeIds: Set<string>,
+  metrics: ReturnType<typeof teamNodeMetrics>,
+): Parameters<typeof elk.layout>[0] {
   const nodes = execution.nodes.filter((node) => nodeIds.has(node.id));
   const edges = execution.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
   return {
@@ -112,16 +129,16 @@ function buildElkGraph(execution: ExecutionIR, nodeIds: Set<string>): Parameters
       "elk.algorithm": "layered",
       "elk.direction": "RIGHT",
       "elk.edgeRouting": "ORTHOGONAL",
-      "elk.spacing.nodeNode": "28",
+      "elk.spacing.nodeNode": String(metrics.nodeGap),
       "elk.layered.spacing.nodeNodeBetweenLayers": "72",
-      "elk.layered.spacing.edgeNodeBetweenLayers": "28",
+      "elk.layered.spacing.edgeNodeBetweenLayers": String(metrics.edgeGap),
       "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
       "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
     },
     children: nodes.map((node) => ({
       id: node.id,
       width: NODE_WIDTHS[node.kind],
-      height: NODE_HEIGHT,
+      height: metrics.height,
     })),
     edges: edges.map((edge) => ({
       id: edge.id,
@@ -131,8 +148,12 @@ function buildElkGraph(execution: ExecutionIR, nodeIds: Set<string>): Parameters
   };
 }
 
-async function layoutExecution(execution: ExecutionIR, nodeIds: Set<string>): Promise<Map<string, { x: number; y: number }>> {
-  const graph = await elk.layout(buildElkGraph(execution, nodeIds));
+async function layoutExecution(
+  execution: ExecutionIR,
+  nodeIds: Set<string>,
+  metrics: ReturnType<typeof teamNodeMetrics>,
+): Promise<Map<string, { x: number; y: number }>> {
+  const graph = await elk.layout(buildElkGraph(execution, nodeIds, metrics));
   return new Map((graph.children ?? []).map((node) => [
     node.id,
     { x: node.x ?? 0, y: node.y ?? 0 },
@@ -150,6 +171,8 @@ export function TeamGraphCanvas({
   selectedNodeId: string | null;
   onSelect: (nodeId: string | null) => void;
 }) {
+  const fontScale = currentUiFontScale();
+  const metrics = useMemo(() => teamNodeMetrics(fontScale), [fontScale]);
   const visibleNodeKey = [...visibleNodeIds].sort().join("|");
   const visibleNodes = useMemo(
     () => execution.nodes.filter((node) => visibleNodeIds.has(node.id)),
@@ -163,9 +186,10 @@ export function TeamGraphCanvas({
     () => [
       execution.executionId,
       visibleNodeKey,
+      metrics.height,
       visibleEdges.map((edge) => `${edge.id}:${edge.source}:${edge.target}`).sort().join(","),
-    ].join("|")
-    , [execution.executionId, visibleNodeKey, visibleEdges],
+    ].join("|"),
+    [execution.executionId, metrics.height, visibleNodeKey, visibleEdges],
   );
   const [positions, setPositions] = useState<Map<string, { x: number; y: number }>>(() => new Map());
   const [isLayoutting, setIsLayoutting] = useState(false);
@@ -173,7 +197,7 @@ export function TeamGraphCanvas({
   useEffect(() => {
     let cancelled = false;
     setIsLayoutting(true);
-    void layoutExecution(execution, new Set(visibleNodeIds))
+    void layoutExecution(execution, new Set(visibleNodeIds), metrics)
       .then((nextPositions) => {
         if (!cancelled) {
           setPositions(nextPositions);
@@ -210,22 +234,22 @@ export function TeamGraphCanvas({
     () => visibleNodes.map((node, index) => ({
       id: node.id,
       type: "team",
-      position: positions.get(node.id) ?? { x: 24, y: 24 + index * (NODE_HEIGHT + 20) },
+      position: positions.get(node.id) ?? { x: 24, y: 24 + index * (metrics.height + metrics.nodeGap) },
       data: {
         node,
         muted: Boolean(selectedNodeId && !relatedNodeIds.has(node.id)),
       },
       style: {
         width: NODE_WIDTHS[node.kind],
-        height: NODE_HEIGHT,
+        height: metrics.height,
       },
       width: NODE_WIDTHS[node.kind],
-      height: NODE_HEIGHT,
+      height: metrics.height,
       draggable: false,
       selectable: true,
       connectable: false,
     })),
-    [visibleNodes, positions, selectedNodeId, relatedNodeIds],
+    [visibleNodes, positions, selectedNodeId, relatedNodeIds, metrics],
   );
 
   const edges = useMemo<TeamFlowEdge[]>(

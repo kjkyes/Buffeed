@@ -3,9 +3,6 @@ import { ArrowLeft, ArrowRight, Copy, ExternalLink, LoaderCircle, Play, Plus, Re
 
 type BrowserTab = { id: string; url: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean };
 type BrowserState = { url: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean; tabs: BrowserTab[]; activeTabId: string | null };
-const TITLE_BAR_OVERLAY_HEIGHT = 0;
-const BASE_LAYOUT_SCALE = 1.09;
-const BASE_BROWSER_HORIZONTAL_SCALE = 1.09;
 const initialState: BrowserState = { url: "", title: "新标签页", loading: false, canGoBack: false, canGoForward: false, tabs: [], activeTabId: null };
 
 export function BrowserTool({ workspace }: { workspace?: string }) {
@@ -75,19 +72,13 @@ export function BrowserTool({ workspace }: { workspace?: string }) {
     void browser.attach();
     const syncBounds = () => {
       const rect = host.getBoundingClientRect();
-      const layoutScale = Number.parseFloat(
-        getComputedStyle(document.documentElement).getPropertyValue("--layout-scale"),
-      ) || 1;
-      const horizontalScale = (layoutScale / BASE_LAYOUT_SCALE) * BASE_BROWSER_HORIZONTAL_SCALE;
       browser.setBounds({
-        // The workbench dimensions are authored in scaled CSS units while
-        // WebContentsView bounds are unscaled window DIP units.
-        x: Math.max(0, rect.left / horizontalScale),
-        y: Math.max(0, rect.top / layoutScale - TITLE_BAR_OVERLAY_HEIGHT),
-        width: rect.width / horizontalScale,
-        // getBoundingClientRect() already returns CSS pixels matching the
-        // WebContentsView DIP coordinate space; layoutScale only sizes the UI.
+        x: Math.max(0, rect.left),
+        y: Math.max(0, rect.top),
+        width: rect.width,
         height: rect.height,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
       });
     };
     let syncFrame: number | undefined;
@@ -102,12 +93,17 @@ export function BrowserTool({ workspace }: { workspace?: string }) {
     observer.observe(host);
     const layoutRoot = host.closest<HTMLElement>(".workbench");
     const layoutObserver = layoutRoot ? new MutationObserver(scheduleSyncBounds) : undefined;
-    layoutObserver?.observe(layoutRoot, { attributes: true, attributeFilter: ["class", "style"] });
+    if (layoutObserver && layoutRoot) {
+      layoutObserver.observe(layoutRoot, { attributes: true, attributeFilter: ["class", "style"] });
+    }
+    const rootObserver = new MutationObserver(scheduleSyncBounds);
+    rootObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["style"] });
     window.addEventListener("resize", scheduleSyncBounds);
     scheduleSyncBounds();
     return () => {
       observer.disconnect();
       layoutObserver?.disconnect();
+      rootObserver.disconnect();
       window.removeEventListener("resize", scheduleSyncBounds);
       if (syncFrame !== undefined) window.cancelAnimationFrame(syncFrame);
       void browser.detach();

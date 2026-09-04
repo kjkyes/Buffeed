@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld("desktop", {
     } | null>,
   apiBaseUrl: () => ipcRenderer.invoke("desktop:api-base-url") as Promise<string>,
   setWindowTheme: (theme: "light" | "dark", backgroundColor: string) => ipcRenderer.invoke("desktop:set-window-theme", theme, backgroundColor) as Promise<void>,
+  setTitleBarOverlayHeight: (height: number) => ipcRenderer.invoke("desktop:set-titlebar-overlay-height", height) as Promise<void>,
   openSessionWindow: (sessionId: string) => ipcRenderer.invoke("desktop:open-session-window", sessionId) as Promise<void>,
   openRagManager: () => ipcRenderer.invoke("desktop:open-rag-manager") as Promise<void>,
   selectPreviewFile: () => ipcRenderer.invoke("desktop:select-preview-file") as Promise<{
@@ -81,7 +82,7 @@ contextBridge.exposeInMainWorld("desktop", {
       tabs: Array<{ id: string; url: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean }>;
       activeTabId: string | null;
     }>,
-    setBounds: (bounds: { x: number; y: number; width: number; height: number }) => {
+    setBounds: (bounds: { x: number; y: number; width: number; height: number; viewportWidth: number; viewportHeight: number }) => {
       ipcRenderer.send("desktop:browser-bounds", bounds);
     },
     onState: (listener: (state: {
