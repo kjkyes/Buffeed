@@ -30,7 +30,7 @@ function loadBuffeedEnv(home: string): void {
 function buffeedHome(): string {
   const configured = process.env.BUFFEED_HOME?.trim();
   if (configured) return path.resolve(configured);
-  if (app.isPackaged) return "D:\\A-xk-project\\.buffeed";
+  if (app.isPackaged) return path.join(app.getPath("home"), ".buffeed");
   return path.resolve(process.cwd(), "..", "..", "..", ".buffeed");
 }
 

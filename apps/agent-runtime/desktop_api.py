@@ -2670,7 +2670,7 @@ async def list_plugins(workspace: str = Query(..., min_length=1)) -> dict[str, A
 
 @app.get("/api/v1/plugins/github/search")
 async def search_github_plugins(q: str = Query(..., min_length=2, max_length=120), kind: Literal["mcp", "skills"] = "mcp") -> dict[str, Any]:
-    query = f"{q} {'mcp server' if kind == 'mcp' else 'SKILL.md'}"
+    query = q if kind == "skills" else f"{q} mcp server"
     data = await asyncio.to_thread(_github_json, "https://api.github.com/search/repositories?per_page=12&q=" + urllib.parse.quote(query))
     return {"items": [{"full_name": item.get("full_name"), "description": item.get("description") or "", "html_url": item.get("html_url"), "default_branch": item.get("default_branch") or "main", "stars": item.get("stargazers_count", 0)} for item in data.get("items", [])]}
 

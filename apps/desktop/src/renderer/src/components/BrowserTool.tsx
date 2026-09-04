@@ -3,8 +3,8 @@ import { ArrowLeft, ArrowRight, Copy, ExternalLink, LoaderCircle, Play, Plus, Re
 
 type BrowserTab = { id: string; url: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean };
 type BrowserState = { url: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean; tabs: BrowserTab[]; activeTabId: string | null };
-const TITLE_BAR_OVERLAY_HEIGHT = -18;
-const BASE_LAYOUT_SCALE = 1.2;
+const TITLE_BAR_OVERLAY_HEIGHT = 0;
+const BASE_LAYOUT_SCALE = 1.09;
 const BASE_BROWSER_HORIZONTAL_SCALE = 1.09;
 const initialState: BrowserState = { url: "", title: "新标签页", loading: false, canGoBack: false, canGoForward: false, tabs: [], activeTabId: null };
 
