@@ -417,6 +417,44 @@ class RagJobStore:
                     connection, task_id, row["status"], status, detail, worker_id
                 )
 
+    async def recover_ingest(self, task_id: UUID, detail: str) -> RagJob:
+        """Requeue an ingest after its external LightRAG document was removed."""
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    f"""
+                    SELECT {_JOB_COLUMNS}
+                    FROM rag.ingest_tasks
+                    WHERE task_id = $1
+                    FOR UPDATE
+                    """,
+                    task_id,
+                )
+                if row is None:
+                    raise ValueError("Unknown RAG task")
+                if row["task_type"] not in {"ingest", "rebuild"}:
+                    raise ValueError("Only ingest tasks can be recovered")
+                if row["status"] != "queued":
+                    raise ValueError("Only queued ingest tasks can be recovered")
+                if row["cancel_requested_at"] is not None:
+                    raise ValueError("Cancelled ingest tasks cannot be recovered")
+                updated = await connection.fetchrow(
+                    f"""
+                    UPDATE rag.ingest_tasks
+                    SET lightrag_track_id = NULL, next_attempt_at = now(),
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        error_detail = $2, updated_at = now()
+                    WHERE task_id = $1
+                    RETURNING {_JOB_COLUMNS}
+                    """,
+                    task_id,
+                    detail[:4000],
+                )
+                await self._record_event(
+                    connection, task_id, row["status"], "queued", detail
+                )
+        return _row_to_job(updated)
+
     async def cancel(self, task_id: UUID, detail: str = "cancel requested") -> RagJob:
         async with self._pool.acquire() as connection:
             async with connection.transaction():

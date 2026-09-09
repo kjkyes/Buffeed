@@ -235,6 +235,7 @@ def _query_payload(
     chunk_top_k: int,
     max_total_tokens: int,
     enable_rerank: bool,
+    include_chunk_content: bool = False,
 ) -> dict[str, Any]:
     normalized_query = query.strip()
     if len(normalized_query) < 3:
@@ -248,6 +249,7 @@ def _query_payload(
             max(256, max_total_tokens), settings.max_total_tokens
         ),
         "enable_rerank": enable_rerank,
+        "include_chunk_content": include_chunk_content,
     }
 
 
@@ -405,7 +407,13 @@ async def rag_retrieve(
     request_id: str | None = None,
 ) -> dict[str, Any]:
     request_payload = _query_payload(
-        query, mode, top_k, chunk_top_k, max_total_tokens, enable_rerank
+        query,
+        mode,
+        top_k,
+        chunk_top_k,
+        max_total_tokens,
+        enable_rerank,
+        include_chunk_content=True,
     )
     async with query_slots:
         hybrid = await get_hybrid_retriever()
@@ -622,6 +630,29 @@ async def rag_retry_task(
     async with write_lock:
         try:
             task = await (await get_job_store()).retry(parsed_task_id)
+        except ValueError as exc:
+            raise LightRAGError(str(exc)) from exc
+    return _task_response(task)
+
+
+@mcp.tool(
+    description=(
+        "Recover one queued ingest whose LightRAG document is stuck in analyzing "
+        "or processing by removing the stale LightRAG document and requeueing upload."
+    ),
+    annotations=DESTRUCTIVE_WRITE,
+)
+@observed_tool("rag_recover_ingest")
+async def rag_recover_ingest(
+    task_id: str, request_id: str | None = None
+) -> dict[str, Any]:
+    parsed_task_id = _parse_task_id(task_id)
+    async with write_lock:
+        try:
+            task = await (await get_job_store()).recover_ingest(
+                parsed_task_id,
+                "Recovered after LightRAG document removal; requeued for upload",
+            )
         except ValueError as exc:
             raise LightRAGError(str(exc)) from exc
     return _task_response(task)

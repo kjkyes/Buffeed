@@ -213,7 +213,7 @@ class RagWorker:
         if job.lightrag_track_id is None:
             source_path = _source_path(job.payload)
             processing_profile = _processing_profile(job.payload)
-            upload_name = _required_payload_text(job.payload, "lightrag_upload_name")
+            upload_name = source_path.name
             page_routing_manifest_path = self._artifact_store.page_routing_manifest_path(
                 _artifact_namespace(job.payload), job.document_id, job.revision
             )

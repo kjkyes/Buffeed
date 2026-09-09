@@ -44,6 +44,10 @@ class DeleteDocumentsRequest(BaseModel):
     delete_llm_cache: bool = False
 
 
+class RecoverIngestRequest(BaseModel):
+    dry_run: bool = True
+
+
 def _request_id(request: Request) -> str:
     supplied = request.headers.get("X-Request-ID", "").strip()
     return supplied[:128] if supplied else str(uuid.uuid4())
@@ -244,6 +248,75 @@ async def rag_cancel_task(
 @app.post("/api/v1/rag/tasks/{task_id}:retry", status_code=202)
 async def rag_retry_task(request: Request, task_id: str) -> dict[str, Any]:
     return await _invoke(request, gateway.rag_retry_task, task_id=task_id)
+
+
+@app.post("/api/v1/rag/tasks/{task_id}:recover", status_code=202)
+async def rag_recover_ingest(
+    request: Request,
+    task_id: str,
+    payload: RecoverIngestRequest,
+    confirmed: str | None = Header(default=None, alias="X-Desktop-Confirmed"),
+) -> dict[str, Any]:
+    try:
+        status = await _invoke(request, gateway.rag_task_status, task_id=task_id)
+    except HTTPException:
+        raise
+    task = status["task"]
+    if task["task_type"] not in {"ingest", "rebuild"}:
+        raise HTTPException(status_code=400, detail="Only ingest tasks can be recovered.")
+    if task["status"] != "queued":
+        raise HTTPException(status_code=400, detail="Only queued ingest tasks can be recovered.")
+    track_id = task.get("lightrag_track_id")
+    if not track_id:
+        raise HTTPException(status_code=400, detail="Task has no LightRAG track ID.")
+    light_status = await _invoke(request, gateway.rag_job_status, track_id=track_id)
+    documents = light_status.get("documents") or []
+    eligible = [
+        item for item in documents
+        if isinstance(item, dict) and item.get("status") in {"analyzing", "processing"}
+    ]
+    if not eligible:
+        raise HTTPException(
+            status_code=409,
+            detail="LightRAG track is not in analyzing or processing state.",
+        )
+    preview = {
+        "task": task,
+        "track_id": track_id,
+        "documents": eligible,
+        "dry_run": payload.dry_run,
+    }
+    if payload.dry_run:
+        return preview
+    _require_confirmation(confirmed)
+    pipeline = await _invoke(request, gateway.rag_pipeline_status)
+    if pipeline.get("busy"):
+        raise HTTPException(
+            status_code=409,
+            detail="LightRAG pipeline is busy; recovery was not started.",
+        )
+    ids = [str(item.get("id")) for item in eligible if item.get("id")]
+    if not ids:
+        raise HTTPException(status_code=409, detail="LightRAG document ID is unavailable.")
+    try:
+        with request_context(_request_id(request)):
+            deleted = await gateway.get_client().delete_documents(
+                ids,
+                delete_files=False,
+                delete_llm_cache=False,
+            )
+    except LightRAGError as exc:
+        raise HTTPException(status_code=502, detail=_safe_detail(exc)) from exc
+    if deleted.get("status") not in {"success", "partial_success", "deletion_started"}:
+        raise HTTPException(status_code=502, detail="LightRAG did not confirm document deletion.")
+    try:
+        recovered = await _invoke(request, gateway.rag_recover_ingest, task_id=task_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="LightRAG document was removed but Buffeed task was not requeued; check logs.",
+        ) from exc
+    return {"preview": preview, "deletion": deleted, "task": recovered}
 
 
 @app.post("/api/v1/rag/documents:delete", status_code=202)

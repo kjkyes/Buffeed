@@ -377,9 +377,7 @@ class RagRegistry:
                         "processing_profile": request.processing_profile,
                         "workspace": workspace,
                         "artifact_namespace": artifact_namespace,
-                        "lightrag_upload_name": (
-                            f"{document_id}-r{revision}{source_path.suffix}"
-                        ),
+                        "lightrag_upload_name": source_path.name,
                     }
                 )
                 await connection.execute(
