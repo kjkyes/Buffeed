@@ -104,6 +104,9 @@ DESKTOP_DISABLED_TOOLS = {
 }
 
 DEFAULT_MODEL_ALIAS = "system"
+GPT_MODELS = ("gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra")
+QWEN_MODELS = ("qwen3.8-max", "qwen3.8-flash")
+GPT_REASONING_EFFORTS = ("light", "medium", "high", "xhigh")
 
 
 def configured_primary_model() -> str:
@@ -111,32 +114,26 @@ def configured_primary_model() -> str:
 
 
 def configured_turn_models() -> list[dict[str, Any]]:
-    """Expose only configured runtime model capabilities to desktop clients."""
-    primary_model = configured_primary_model()
-    raw_models = os.getenv("DASHSCOPE_VIDEO_MODELS", "").strip()
-    configured = raw_models.split(",") if raw_models else [os.getenv("DASHSCOPE_VIDEO_MODEL", "").strip()]
-    models: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    if primary_model:
-        models.append({
-            "id": primary_model,
-            "label": primary_model,
+    """Expose the desktop-supported model capabilities in a stable order."""
+    return [
+        {
+            "id": model_id,
+            "label": model_id,
             "provider": "anthropic-compatible",
             "supports_video": False,
-        })
-        seen.add(primary_model)
-    for value in configured:
-        model_id = value.strip()
-        if not model_id or model_id in seen:
-            continue
-        seen.add(model_id)
-        models.append({
+            "reasoning_efforts": list(GPT_REASONING_EFFORTS),
+        }
+        for model_id in GPT_MODELS
+    ] + [
+        {
             "id": model_id,
             "label": model_id,
             "provider": "dashscope",
-            "supports_video": True,
-        })
-    return models
+            "supports_video": model_id == "qwen3.8-max",
+            "reasoning_efforts": [],
+        }
+        for model_id in QWEN_MODELS
+    ]
 
 
 def configured_turn_model_ids() -> set[str]:
@@ -151,6 +148,15 @@ def resolve_turn_model(model: str | None) -> str:
         raise ValueError("MODEL_ID must be configured before submitting a turn")
     if requested not in configured_turn_model_ids():
         raise ValueError("不支持的模型")
+    return requested
+
+
+def resolve_reasoning_effort(model: str, effort: str | None) -> str | None:
+    if model not in GPT_MODELS:
+        return None
+    requested = str(effort or os.getenv("BUFFEED_DEFAULT_REASONING_EFFORT", "high")).strip().lower()
+    if requested not in GPT_REASONING_EFFORTS:
+        raise ValueError("不支持的思考强度")
     return requested
 
 
@@ -374,6 +380,18 @@ def _git_change_snapshot(
     }
 
 
+def _empty_change_snapshot(turn_id: str | None = None) -> dict[str, Any]:
+    return {
+        "turn_id": turn_id,
+        "attribution": "agent_tool",
+        "available": True,
+        "files": [],
+        "total_files": 0,
+        "total_additions": 0,
+        "total_deletions": 0,
+    }
+
+
 _FILE_MISSING = object()
 
 
@@ -390,13 +408,7 @@ def _workspace_file_snapshots(
     workspace: Path,
     extra_paths: set[str] | None = None,
 ) -> dict[str, str | object]:
-    """Capture only paths observed during this turn.
-
-    Existing dirty files are tracked by Git status, but reading every dirty
-    file at a turn boundary makes large workspaces (especially node_modules)
-    block the HTTP request. Tool events add the small set of paths that need a
-    before/after content snapshot.
-    """
+    """Capture only paths targeted by one Agent write operation."""
     paths = set(extra_paths or ())
     snapshots: dict[str, str | object] = {}
     for path in paths:
@@ -864,6 +876,24 @@ class ApprovalBroker:
 
 
 @dataclass
+class TurnPerformance:
+    accepted_at: float | None = None
+    worker_started_at: float | None = None
+    turn_started_at: float | None = None
+    first_model_requested_at: float | None = None
+    first_stream_delta_at: float | None = None
+    last_stream_delta_at: float | None = None
+    stream_finished_at: float | None = None
+    terminal_at: float | None = None
+    model_requests: int = 0
+    model_responses: int = 0
+    responses_without_usage: int = 0
+    reported_output_tokens: int = 0
+    stream_delta_events: int = 0
+    streamed_characters: int = 0
+
+
+@dataclass
 class SessionRuntime:
     manager: "DesktopManager"
     session_id: str
@@ -888,12 +918,15 @@ class SessionRuntime:
     baseline_paths: set[str] = field(default_factory=set)
     turn_file_snapshots: dict[str, str | object] = field(default_factory=dict)
     turn_file_ledger: dict[str, dict[str, Any]] = field(default_factory=dict)
+    turn_file_ledger_turn_id: str | None = None
     turn_pending_file_ops: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     turn_lifecycle_counts: dict[str, int] = field(default_factory=dict)
     cancel_requested_member_names: list[str] = field(default_factory=list)
-    queued_turns: deque[tuple[str, str, list[dict[str, Any]], str]] = field(default_factory=deque)
+    queued_turns: deque[tuple[str, str, list[dict[str, Any]], str, str | None]] = field(default_factory=deque)
     steer_lock: threading.Lock = field(default_factory=threading.Lock)
     pending_steers: deque[dict[str, Any]] = field(default_factory=deque)
+    performance_lock: threading.Lock = field(default_factory=threading.Lock)
+    turn_performance: dict[str, TurnPerformance] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.baseline_paths = self.manager.project_baseline_paths(self.workspace)
@@ -904,22 +937,144 @@ class SessionRuntime:
             replay=lambda after: self.manager.store.events_after(self.session_id, after),
         )
 
+    def _begin_turn_performance(self, turn_id: str) -> None:
+        turn = self.manager.store.get_turn(turn_id)
+        accepted_at = float(turn["created_at"]) if turn is not None else None
+        with self.performance_lock:
+            self.turn_performance[turn_id] = TurnPerformance(accepted_at=accepted_at)
+
+    def _mark_turn_worker_started(self, turn_id: str) -> None:
+        with self.performance_lock:
+            metrics = self.turn_performance.setdefault(turn_id, TurnPerformance())
+            metrics.worker_started_at = _now()
+
+    def record_model_output_usage(self, turn_id: str, output_tokens: int | None) -> None:
+        with self.performance_lock:
+            metrics = self.turn_performance.setdefault(turn_id, TurnPerformance())
+            metrics.model_responses += 1
+            if output_tokens is None:
+                metrics.responses_without_usage += 1
+            else:
+                metrics.reported_output_tokens += output_tokens
+
+    def _clear_turn_performance(self, turn_id: str) -> None:
+        with self.performance_lock:
+            self.turn_performance.pop(turn_id, None)
+
+    def _record_turn_performance_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        turn_id: str | None,
+    ) -> None:
+        if not turn_id:
+            return
+        timestamp = _now()
+        with self.performance_lock:
+            metrics = self.turn_performance.setdefault(turn_id, TurnPerformance())
+            if event_type == "turn.started" and metrics.turn_started_at is None:
+                metrics.turn_started_at = timestamp
+            elif event_type == "model.requested":
+                metrics.model_requests += 1
+                if metrics.first_model_requested_at is None:
+                    metrics.first_model_requested_at = timestamp
+            elif event_type == "assistant.message":
+                delta = payload.get("delta")
+                if str(payload.get("phase") or "") == "streaming" and isinstance(delta, str) and delta:
+                    metrics.first_stream_delta_at = metrics.first_stream_delta_at or timestamp
+                    metrics.last_stream_delta_at = timestamp
+                    metrics.stream_delta_events += 1
+                    metrics.streamed_characters += len(delta)
+                if payload.get("stream_done") is True and metrics.first_stream_delta_at is not None:
+                    metrics.stream_finished_at = timestamp
+            elif event_type in {"turn.finished", "turn.error"}:
+                metrics.terminal_at = timestamp
+
+    def _turn_performance_snapshot(
+        self,
+        turn_id: str,
+        terminal_event: str,
+    ) -> dict[str, Any]:
+        def duration_ms(started_at: float | None, ended_at: float | None) -> float | None:
+            if started_at is None or ended_at is None:
+                return None
+            return round(max(0.0, ended_at - started_at) * 1_000, 2)
+
+        with self.performance_lock:
+            metrics = self.turn_performance.get(turn_id, TurnPerformance())
+            stream_duration_ms = duration_ms(
+                metrics.first_stream_delta_at,
+                metrics.stream_finished_at or metrics.last_stream_delta_at,
+            )
+            usage_state = (
+                "complete"
+                if metrics.model_responses > 0 and metrics.responses_without_usage == 0
+                else "partial" if metrics.reported_output_tokens > 0 else "unavailable"
+            )
+            exact_output_tokens = (
+                metrics.reported_output_tokens if usage_state == "complete" else None
+            )
+            single_request_tokens_per_second = None
+            if (
+                metrics.model_responses == 1
+                and exact_output_tokens is not None
+                and stream_duration_ms is not None
+                and stream_duration_ms > 0
+            ):
+                single_request_tokens_per_second = round(
+                    exact_output_tokens / (stream_duration_ms / 1_000), 2
+                )
+            streamed_characters_per_second = None
+            if (
+                metrics.model_responses == 1
+                and stream_duration_ms is not None
+                and stream_duration_ms > 0
+            ):
+                streamed_characters_per_second = round(
+                    metrics.streamed_characters / (stream_duration_ms / 1_000), 2
+                )
+            return {
+                "schema_version": 1,
+                "terminal_event": terminal_event,
+                "durations_ms": {
+                    "queue_wait": duration_ms(metrics.accepted_at, metrics.turn_started_at),
+                    "worker_start_wait": duration_ms(metrics.accepted_at, metrics.worker_started_at),
+                    "turn_start_to_first_model_request": duration_ms(
+                        metrics.turn_started_at, metrics.first_model_requested_at
+                    ),
+                    "first_model_ttft": duration_ms(
+                        metrics.first_model_requested_at, metrics.first_stream_delta_at
+                    ),
+                    "turn_start_to_first_stream_delta": duration_ms(
+                        metrics.turn_started_at, metrics.first_stream_delta_at
+                    ),
+                    "accepted_to_first_stream_delta": duration_ms(
+                        metrics.accepted_at, metrics.first_stream_delta_at
+                    ),
+                    "streaming": stream_duration_ms,
+                    "accepted_to_terminal": duration_ms(metrics.accepted_at, metrics.terminal_at),
+                },
+                "model": {
+                    "requests": metrics.model_requests,
+                    "responses": metrics.model_responses,
+                    "output_token_usage": usage_state,
+                    "output_tokens": exact_output_tokens,
+                    "reported_output_tokens": metrics.reported_output_tokens or None,
+                    "responses_without_usage": metrics.responses_without_usage,
+                    "single_request_output_tokens_per_second": single_request_tokens_per_second,
+                },
+                "stream": {
+                    "delta_events": metrics.stream_delta_events,
+                    "characters": metrics.streamed_characters,
+                    "characters_per_second": streamed_characters_per_second,
+                },
+            }
+
     def changes_snapshot(self, *, include_protected: bool = False) -> dict[str, Any]:
         baseline_paths = self._baseline_for_snapshot()
-        # The turn ledger is the stable source of truth while a turn is active
-        # and for the last completed turn. Git is only a fallback for a cold
-        # session with no turn-local observations.
-        snapshot = (
-            {
-                "available": True,
-                "files": [],
-                "total_files": 0,
-                "total_additions": 0,
-                "total_deletions": 0,
-            }
-            if self.active_turn_id is not None or self.turn_file_ledger
-            else _git_change_snapshot(self.workspace)
-        )
+        # Only the turn ledger has Agent authorship information. A workspace
+        # Git diff may also contain edits made directly by the user.
+        snapshot = _empty_change_snapshot(self.turn_file_ledger_turn_id)
         files = {item["path"]: item for item in snapshot["files"]}
         for path, delta in self.turn_file_ledger.items():
             if _is_internal_runtime_path(path):
@@ -1080,54 +1235,60 @@ class SessionRuntime:
         input_data = payload.get("input")
         if not isinstance(input_data, dict):
             return
-        raw_paths: set[str] = set()
-        for key in ("path", "file_path", "filename"):
-            value = input_data.get(key)
-            if isinstance(value, str) and value.strip():
-                raw_paths.add(value)
-        for key in ("command", "cmd"):
-            value = input_data.get(key)
-            if isinstance(value, str):
-                raw_paths.update(_command_file_paths(value))
-        for raw_path in raw_paths:
+        tool_use_id = str(payload.get("tool_use_id") or "").strip()
+        if not tool_use_id:
+            return
+        tool_name = str(payload.get("tool_name") or "").strip().lower()
+        operations: dict[str, dict[str, Any]] = {}
+        if tool_name in {"write_file", "edit_file"}:
+            raw_path = None
+            for key in ("path", "file_path", "filename"):
+                value = input_data.get(key)
+                if isinstance(value, str) and value.strip():
+                    raw_path = value
+                    break
+            if raw_path:
+                operations[raw_path] = {
+                    "created": tool_name == "write_file",
+                    "deleted": False,
+                    "created_lines": 0,
+                    "created_content": "",
+                }
+        elif tool_name == "bash":
+            command = input_data.get("command") or input_data.get("cmd")
+            if isinstance(command, str):
+                operations = _command_file_operations(command)
+        else:
+            return
+
+        normalized_operations: dict[str, dict[str, Any]] = {}
+        for raw_path, operation in operations.items():
             path = _normalize_git_path(raw_path).strip("'\"")
             if not path or path.startswith("-"):
                 continue
             absolute = (self.workspace / Path(path)).resolve()
             try:
-                relative = absolute.relative_to(self.workspace)
+                normalized = _normalize_git_path(str(absolute.relative_to(self.workspace)))
             except ValueError:
                 continue
-            normalized = _normalize_git_path(str(relative))
-            if normalized not in self.turn_file_snapshots:
-                self.turn_file_snapshots[normalized] = _file_snapshot(absolute)
+            previous = _file_snapshot(absolute)
+            normalized_operation = dict(operation)
+            normalized_operation["was_missing"] = previous is _FILE_MISSING
+            normalized_operations[normalized] = normalized_operation
+            # Refresh at every write request so edits made by the user before
+            # this Agent operation are outside its attribution window.
+            self.turn_file_snapshots[normalized] = previous
+        if normalized_operations:
+            self.turn_pending_file_ops[tool_use_id] = normalized_operations
 
+    def _record_file_delta(self, payload: dict[str, Any]) -> None:
         tool_use_id = str(payload.get("tool_use_id") or "").strip()
-        if not tool_use_id:
+        pending_operations = self.turn_pending_file_ops.pop(tool_use_id, {})
+        if not pending_operations:
             return
-        for key in ("command", "cmd"):
-            value = input_data.get(key)
-            if not isinstance(value, str):
-                continue
-            operations = _command_file_operations(value)
-            normalized_operations: dict[str, dict[str, Any]] = {}
-            for raw_path, operation in operations.items():
-                absolute = (self.workspace / Path(raw_path)).resolve()
-                try:
-                    normalized = _normalize_git_path(str(absolute.relative_to(self.workspace)))
-                except ValueError:
-                    continue
-                operation = dict(operation)
-                operation["was_missing"] = (
-                    self.turn_file_snapshots.get(normalized, _FILE_MISSING) is _FILE_MISSING
-                )
-                normalized_operations[normalized] = operation
-            if normalized_operations:
-                self.turn_pending_file_ops[tool_use_id] = normalized_operations
-
-    def _record_file_delta(self, payload: dict[str, Any] | None = None) -> None:
-        current = _workspace_file_snapshots(self.workspace, set(self.turn_file_snapshots))
-        for path in set(self.turn_file_snapshots) | set(current):
+        tracked_paths = set(pending_operations)
+        current = _workspace_file_snapshots(self.workspace, tracked_paths)
+        for path in tracked_paths:
             previous = self.turn_file_snapshots.get(path, _FILE_MISSING)
             next_value = current.get(path, _FILE_MISSING)
             additions, deletions = _line_delta(previous, next_value)
@@ -1158,9 +1319,7 @@ class SessionRuntime:
                 delta["diff_lines"] = (delta.get("diff_lines") or []) + _line_diff_lines(
                     previous, next_value
                 )
-        tool_use_id = str((payload or {}).get("tool_use_id") or "").strip()
-        pending_operations = self.turn_pending_file_ops.pop(tool_use_id, {})
-        output = str((payload or {}).get("output") or "")
+        output = str(payload.get("output") or "")
         command_succeeded = not output.lstrip().lower().startswith("error:")
         for path, operation in pending_operations.items():
             if not command_succeeded or not operation.get("was_missing"):
@@ -1193,7 +1352,7 @@ class SessionRuntime:
                 {"kind": "addition", "newLine": index, "text": line}
                 for index, line in enumerate(content_lines, start=1)
             ]
-        self.turn_file_snapshots = current
+        self.turn_file_snapshots.update(current)
 
     def revert_changes(self) -> dict[str, Any]:
         with self.turn_lock:
@@ -1234,6 +1393,7 @@ class SessionRuntime:
                     raise RuntimeError(f"Unable to remove untracked file {item['path']}: {exc}") from exc
             changes = self.changes_snapshot()
             self.turn_file_ledger.clear()
+            self.turn_file_ledger_turn_id = None
             self.turn_file_snapshots = {}
             self.turn_pending_file_ops.clear()
             self.manager.schedule_project_baseline_refresh(self.workspace)
@@ -1264,28 +1424,44 @@ class SessionRuntime:
         payload: dict[str, Any],
         turn_id: str | None = None,
     ) -> None:
+        self._record_turn_performance_event(event_type, payload, turn_id)
         if turn_id and event_type in {"model.requested", "assistant.message"}:
             if event_type == "model.requested" or str(payload.get("phase") or "final") == "final":
                 key = "model_requests" if event_type == "model.requested" else "replies"
                 self.turn_lifecycle_counts[key] = self.turn_lifecycle_counts.get(key, 0) + 1
         if event_type == "turn.finished" and turn_id:
+            performance = self._turn_performance_snapshot(turn_id, event_type)
+            self.manager.store.save_runtime_performance(
+                self.session_id, turn_id, performance
+            )
             payload = {
                 **payload,
                 "lifecycle_summary": {
                     "model_requests": self.turn_lifecycle_counts.get("model_requests", 0),
                     "replies": self.turn_lifecycle_counts.get("replies", 0),
                 },
+                "performance": performance,
                 # Persist the turn-local snapshot so historical answers can
                 # render their own HUD without reading a later turn's state.
                 "changes": self.changes_snapshot(),
             }
         elif event_type == "turn.error" and turn_id:
-            payload = {**payload, "changes": self.changes_snapshot()}
+            performance = self._turn_performance_snapshot(turn_id, event_type)
+            self.manager.store.save_runtime_performance(
+                self.session_id, turn_id, performance
+            )
+            payload = {
+                **payload,
+                "performance": performance,
+                "changes": self.changes_snapshot(),
+            }
         if event_type == "tool.requested":
             self._remember_tool_paths(payload)
         self.broker.publish(event_type, payload, turn_id)
         if event_type == "tool.result":
             self._record_file_delta(payload)
+        if event_type == "turn.finished" and turn_id:
+            self._clear_turn_performance(turn_id)
 
     def publish_team_event(
         self,
@@ -1572,7 +1748,7 @@ class SessionRuntime:
                     status="queued",
                 )
                 self.manager.store.set_session_status(self.session_id, "running")
-                self.queued_turns.append((queue_turn_id, query, [], "system"))
+                self.queued_turns.append((queue_turn_id, query, [], "system", None))
             self.publish(
                 "user_interjection",
                 {
@@ -1595,7 +1771,13 @@ class SessionRuntime:
                 queue_turn_id,
             )
 
-    def submit_turn(self, query: str, attachments: list[dict[str, Any]] | None = None, model: str = "system") -> tuple[str, str]:
+    def submit_turn(
+        self,
+        query: str,
+        attachments: list[dict[str, Any]] | None = None,
+        model: str = "system",
+        reasoning_effort: str | None = None,
+    ) -> tuple[str, str]:
         """Persist a message immediately, then run it or enqueue it FIFO."""
         turn_id = str(uuid.uuid4())
         with self.turn_lock:
@@ -1609,9 +1791,10 @@ class SessionRuntime:
                     status="queued",
                     attachments=attachments,
                     model=model,
+                    reasoning_effort=reasoning_effort,
                 )
                 self.manager.store.set_session_status(self.session_id, "running")
-                self.queued_turns.append((turn_id, query, attachments or [], model))
+                self.queued_turns.append((turn_id, query, attachments or [], model, reasoning_effort))
                 self.publish(
                     "turn.queued",
                     {
@@ -1630,8 +1813,9 @@ class SessionRuntime:
                 status="running",
                 attachments=attachments,
                 model=model,
+                reasoning_effort=reasoning_effort,
             )
-            self._start_turn_locked(turn_id, query, attachments or [], model)
+            self._start_turn_locked(turn_id, query, attachments or [], model, reasoning_effort)
             return turn_id, "running"
 
     def start_turn(self, query: str) -> str:
@@ -1640,7 +1824,12 @@ class SessionRuntime:
         return turn_id
 
     def _start_turn_locked(
-        self, turn_id: str, query: str, attachments: list[dict[str, Any]] | None = None, model: str = "system"
+        self,
+        turn_id: str,
+        query: str,
+        attachments: list[dict[str, Any]] | None = None,
+        model: str = "system",
+        reasoning_effort: str | None = None,
     ) -> None:
         suspend_members = getattr(self.Buffeed, "cancel_active_teammates", None)
         if callable(suspend_members):
@@ -1648,9 +1837,11 @@ class SessionRuntime:
         self.baseline_paths = self.manager.project_baseline_paths(self.workspace)
         self.turn_file_snapshots = {}
         self.turn_file_ledger.clear()
+        self.turn_file_ledger_turn_id = turn_id
         self.turn_pending_file_ops.clear()
         self.turn_lifecycle_counts.clear()
         self.cancel_requested_member_names.clear()
+        self._begin_turn_performance(turn_id)
         self.active_turn_id = turn_id
         with self.team_lock:
             execution_id = f"turn:{turn_id}"
@@ -1665,7 +1856,7 @@ class SessionRuntime:
         self.manager.store.set_session_status(self.session_id, "running")
         self.turn_thread = threading.Thread(
             target=self._run_turn,
-            args=(turn_id, query, attachments or [], model),
+            args=(turn_id, query, attachments or [], model, reasoning_effort),
             name=f"desktop-turn-{self.session_id[:8]}",
             daemon=True,
         )
@@ -1674,17 +1865,32 @@ class SessionRuntime:
     def resume_queued_turns(self) -> None:
         """Recover durable queued messages after a runtime is restored."""
         with self.turn_lock:
-            known = {turn_id for turn_id, _, _, _ in self.queued_turns}
+            known = {turn_id for turn_id, _, _, _, _ in self.queued_turns}
             for item in self.manager.store.queued_turns(self.session_id):
                 turn_id = str(item["turn_id"])
                 if turn_id not in known:
-                    self.queued_turns.append((turn_id, str(item["query"]), list(item.get("attachments") or []), str(item.get("model") or "system")))
+                    self.queued_turns.append((
+                        turn_id,
+                        str(item["query"]),
+                        list(item.get("attachments") or []),
+                        str(item.get("model") or "system"),
+                        item.get("reasoning_effort"),
+                    ))
                     known.add(turn_id)
             if self.active_turn_id is None and self.queued_turns:
-                turn_id, query, attachments, model = self.queued_turns.popleft()
-                self._start_turn_locked(turn_id, query, attachments, model)
+                turn_id, query, attachments, model, reasoning_effort = self.queued_turns.popleft()
+                self._start_turn_locked(turn_id, query, attachments, model, reasoning_effort)
 
-    def _run_turn(self, turn_id: str, query: str, attachments: list[dict[str, Any]], model: str) -> None:
+    def _run_turn(
+        self,
+        turn_id: str,
+        query: str,
+        attachments: list[dict[str, Any]],
+        model: str,
+        reasoning_effort: str | None,
+    ) -> None:
+        self._mark_turn_worker_started(turn_id)
+
         def emit(event_type: str, payload: dict[str, Any]) -> None:
             self.publish(event_type, payload, turn_id)
             self.publish_lead_progress(event_type, payload, turn_id)
@@ -1696,11 +1902,15 @@ class SessionRuntime:
                 query,
                 attachments=attachments,
                 model=effective_model,
+                reasoning_effort=reasoning_effort,
                 event_sink=emit,
                 approval_resolver=lambda block: self.approvals.request(block, turn_id),
                 is_cancelled=self.cancel_event.is_set,
                 interjection_provider=lambda: self._drain_steers(turn_id),
                 interjection_fallback=lambda items: self._enqueue_steer_fallback(turn_id, items),
+                model_usage_sink=lambda output_tokens: self.record_model_output_usage(
+                    turn_id, output_tokens
+                ),
                 allow_background=False,
             )
             turn_status = str(result.get("status", "completed"))
@@ -1709,7 +1919,6 @@ class SessionRuntime:
                 member_reports = self._await_team_cancellation_reports(
                     list(self.cancel_requested_member_names)
                 )
-                self._record_file_delta()
                 stop_summary, cancellation_details = self._build_cancellation_summary(
                     result,
                     member_reports,
@@ -1733,8 +1942,6 @@ class SessionRuntime:
             suspend_members = getattr(self.Buffeed, "cancel_active_teammates", None)
             if callable(suspend_members):
                 suspend_members("turn_finished")
-            # Make the final changes snapshot visible before the renderer reacts to turn.finished.
-            self._record_file_delta()
             self.publish("turn.finished", result, turn_id)
         except Exception as exc:
             turn_status = "error"
@@ -1743,18 +1950,17 @@ class SessionRuntime:
             suspend_members = getattr(self.Buffeed, "cancel_active_teammates", None)
             if callable(suspend_members):
                 suspend_members("turn_error")
-            self._record_file_delta()
             self.publish(
                 "turn.error",
                 {"error_type": type(exc).__name__, "message": str(exc)},
                 turn_id,
             )
+            self._clear_turn_performance(turn_id)
         finally:
             if turn_status in {"cancelled", "error"}:
                 self._fail_pending_steers(turn_id, turn_status)
             else:
                 self._enqueue_steer_fallback(turn_id, self._drain_steers(turn_id))
-            self._record_file_delta()
             with self.turn_lock:
                 self.active_turn_id = None
                 self.turn_thread = None
@@ -2162,12 +2368,14 @@ class DesktopManager:
         attachments: list[dict[str, Any]] | None = None,
         request_id: str | None = None,
         model: str = "system",
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """Durably queue a turn before any runtime lock, restore or model work."""
         session = self.store.get_session(session_id)
         if session is None:
             raise KeyError(session_id)
         effective_model = resolve_turn_model(model)
+        effective_reasoning_effort = resolve_reasoning_effort(effective_model, reasoning_effort)
         normalized_attachments = self._normalize_attachments(
             Path(str(session["workspace"])), attachments or []
         )
@@ -2178,6 +2386,7 @@ class DesktopManager:
             max_queued_turns=MAX_QUEUED_TURNS,
             attachments=normalized_attachments,
             model=effective_model,
+            reasoning_effort=effective_reasoning_effort,
         )
         runtime = self.get_cached_runtime(session_id)
         if runtime is not None:
@@ -2256,11 +2465,12 @@ class DesktopManager:
         attachments: list[dict[str, Any]] | None = None,
         request_id: str | None = None,
         model: str = "system",
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         runtime = self.get_cached_runtime(session_id)
         if delivery == "steer" and runtime is not None:
             return runtime.deliver_turn(query, delivery)
-        return self.submit_turn(session_id, query, attachments, request_id, model)
+        return self.submit_turn(session_id, query, attachments, request_id, model, reasoning_effort)
 
     def cancel_turn(self, session_id: str, turn_id: str) -> bool:
         runtime = self.get_cached_runtime(session_id)
@@ -2508,7 +2718,15 @@ class CreateTurnRequest(BaseModel):
     delivery: Literal["queue", "steer"] = "queue"
     request_id: str | None = Field(default=None, min_length=1, max_length=128)
     model: str = Field(default="system", min_length=1, max_length=256)
+    reasoning_effort: Literal["light", "medium", "high", "xhigh"] | None = None
     attachments: list[TurnAttachment] = Field(default_factory=list, max_length=MAX_TURN_ATTACHMENTS)
+
+
+class RendererPerformanceRequest(BaseModel):
+    schema_version: Literal[1] = 1
+    submit_to_sse_first_delta_ms: float = Field(ge=0, le=600_000)
+    submit_to_first_paint_ms: float = Field(ge=0, le=600_000)
+    sse_first_delta_to_first_paint_ms: float = Field(ge=0, le=60_000)
 
 
 class ForkSessionRequest(BaseModel):
@@ -2823,7 +3041,21 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/v1/models")
 async def list_models() -> dict[str, Any]:
-    return {"models": configured_turn_models()}
+    default_effort = str(os.getenv("BUFFEED_DEFAULT_REASONING_EFFORT", "high")).strip().lower()
+    if default_effort not in GPT_REASONING_EFFORTS:
+        default_effort = "high"
+    configured_model = configured_primary_model()
+    default_model = (
+        configured_model
+        if configured_model in configured_turn_model_ids()
+        else GPT_MODELS[0]
+    )
+    return {
+        "models": configured_turn_models(),
+        "default_model": default_model,
+        "reasoning_efforts": list(GPT_REASONING_EFFORTS),
+        "default_reasoning_effort": default_effort,
+    }
 
 
 @app.get("/api/v1/sessions")
@@ -3037,6 +3269,7 @@ async def create_turn(session_id: str, request: CreateTurnRequest) -> dict[str, 
             [item.model_dump() for item in request.attachments],
             request.request_id,
             request.model,
+            request.reasoning_effort,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -3053,6 +3286,45 @@ async def get_turn(session_id: str, turn_id: str) -> dict[str, Any]:
     if turn is None or str(turn["session_id"]) != session_id:
         raise HTTPException(status_code=404, detail="Unknown turn")
     return turn
+
+
+@app.get("/api/v1/sessions/{session_id}/turns/{turn_id}/performance")
+async def get_turn_performance(session_id: str, turn_id: str) -> dict[str, Any]:
+    turn = await asyncio.to_thread(store.get_turn, turn_id)
+    if turn is None or str(turn["session_id"]) != session_id:
+        raise HTTPException(status_code=404, detail="Unknown turn")
+    performance = await asyncio.to_thread(
+        store.get_turn_performance, session_id, turn_id
+    )
+    return {
+        "turn_id": turn_id,
+        "session_id": session_id,
+        "status": str(turn["status"]),
+        "performance": performance,
+    }
+
+
+@app.post("/api/v1/sessions/{session_id}/turns/{turn_id}/performance/renderer")
+async def report_renderer_performance(
+    session_id: str,
+    turn_id: str,
+    request: RendererPerformanceRequest,
+) -> dict[str, Any]:
+    turn = await asyncio.to_thread(store.get_turn, turn_id)
+    if turn is None or str(turn["session_id"]) != session_id:
+        raise HTTPException(status_code=404, detail="Unknown turn")
+    performance = await asyncio.to_thread(
+        store.save_renderer_performance,
+        session_id,
+        turn_id,
+        request.model_dump(),
+    )
+    return {"turn_id": turn_id, "session_id": session_id, "performance": performance}
+
+
+@app.get("/api/v1/performance/recent")
+async def recent_turn_performance(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+    return {"items": await asyncio.to_thread(store.recent_turn_performance, limit)}
 
 
 @app.post("/api/v1/sessions/{session_id}/turns/{turn_id}:cancel", status_code=202)
@@ -3075,13 +3347,9 @@ async def get_session_changes(session_id: str) -> dict[str, Any]:
         workspace = Path(str(session["workspace"])).expanduser().resolve()
         manager.warm_session(session_id)
         baseline_paths = manager.project_baseline_paths(workspace)
-        snapshot = await asyncio.to_thread(_git_change_snapshot, workspace)
-        snapshot["files"] = [
-            item for item in snapshot["files"] if item["path"] not in baseline_paths
-        ]
-        snapshot["total_files"] = len(snapshot["files"])
-        snapshot["total_additions"] = sum(item["additions"] for item in snapshot["files"])
-        snapshot["total_deletions"] = sum(item["deletions"] for item in snapshot["files"])
+        # A cold runtime has no turn-local Agent ledger. Do not substitute the
+        # workspace Git diff because it also contains user-authored changes.
+        snapshot = _empty_change_snapshot()
     snapshot["protected_paths"] = sorted(
         item["path"] for item in snapshot["files"]
         if item["path"] in baseline_paths

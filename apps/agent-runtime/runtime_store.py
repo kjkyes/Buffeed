@@ -38,6 +38,14 @@ def _parse_json_list(value: Any) -> list[dict[str, Any]]:
     return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
 
 
+def _parse_json_object(value: Any) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _clip_event_text(value: Any, limit: int) -> str:
     text = str(value or "")
     if len(text) <= limit:
@@ -171,7 +179,8 @@ class DesktopStore:
                     created_at REAL NOT NULL,
                     finished_at REAL,
                     attachments TEXT NOT NULL DEFAULT '[]',
-                    model TEXT NOT NULL DEFAULT 'system'
+                    model TEXT NOT NULL DEFAULT 'system',
+                    reasoning_effort TEXT
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,6 +202,15 @@ class DesktopStore:
                     created_at REAL NOT NULL,
                     resolved_at REAL
                 );
+                CREATE TABLE IF NOT EXISTS turn_performance (
+                    turn_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    runtime_metrics TEXT,
+                    renderer_metrics TEXT,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_turn_performance_recent
+                    ON turn_performance (updated_at DESC);
                 """
             )
             columns = {
@@ -214,6 +232,10 @@ class DesktopStore:
             if "model" not in turn_columns:
                 connection.execute(
                     "ALTER TABLE turns ADD COLUMN model TEXT NOT NULL DEFAULT 'system'"
+                )
+            if "reasoning_effort" not in turn_columns:
+                connection.execute(
+                    "ALTER TABLE turns ADD COLUMN reasoning_effort TEXT"
                 )
 
     def recover_orphaned_turns(self) -> int:
@@ -316,7 +338,7 @@ class DesktopStore:
             if selected is None:
                 raise KeyError(turn_id)
             turns = connection.execute(
-                "SELECT turn_id, query, status, created_at, finished_at, attachments, model FROM turns "
+                "SELECT turn_id, query, status, created_at, finished_at, attachments, model, reasoning_effort FROM turns "
                 "WHERE session_id = ? AND created_at <= ? ORDER BY created_at ASC",
                 (source_session_id, float(selected["created_at"])),
             ).fetchall()
@@ -338,8 +360,8 @@ class DesktopStore:
                 if status in {"running", "queued"}:
                     status = "cancelled"
                 connection.execute(
-                    "INSERT INTO turns (turn_id, session_id, query, status, created_at, finished_at, attachments, model) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO turns (turn_id, session_id, query, status, created_at, finished_at, attachments, model, reasoning_effort) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         f"{new_session_id}:{row['turn_id']}",
                         new_session_id,
@@ -349,6 +371,7 @@ class DesktopStore:
                         row["finished_at"] if row["finished_at"] is not None else (now if status == "cancelled" else None),
                         str(row["attachments"] or "[]"),
                         str(row["model"] or "system"),
+                        str(row["reasoning_effort"] or ""),
                     ),
                 )
             event_rows = connection.execute(
@@ -455,12 +478,13 @@ class DesktopStore:
         status: str = "running",
         attachments: list[dict[str, Any]] | None = None,
         model: str = "system",
+        reasoning_effort: str | None = None,
     ) -> None:
         with self._lock, self._connection() as connection:
             connection.execute(
-                "INSERT INTO turns (turn_id, session_id, query, status, created_at, finished_at, attachments, model) "
-                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
-                (turn_id, session_id, query, status, _now(), _json(attachments or []), model),
+                "INSERT INTO turns (turn_id, session_id, query, status, created_at, finished_at, attachments, model, reasoning_effort) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (turn_id, session_id, query, status, _now(), _json(attachments or []), model, reasoning_effort or ""),
             )
             connection.execute(
                 "UPDATE sessions SET title = ? WHERE session_id = ? AND (title IS NULL OR title = '')",
@@ -476,6 +500,7 @@ class DesktopStore:
         max_queued_turns: int,
         attachments: list[dict[str, Any]] | None = None,
         model: str = "system",
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """Atomically accept one turn so client retries cannot duplicate work."""
         now = _now()
@@ -488,13 +513,15 @@ class DesktopStore:
                 raise KeyError(session_id)
 
             existing = connection.execute(
-                "SELECT session_id, query, status, attachments, model FROM turns WHERE turn_id = ?",
+                "SELECT session_id, query, status, attachments, model, reasoning_effort FROM turns WHERE turn_id = ?",
                 (turn_id,),
             ).fetchone()
             if existing is not None:
                 if (str(existing["session_id"]) != session_id or str(existing["query"]) != query
                         or str(existing["attachments"] or "[]") != _json(attachments or [])
                         or str(existing["model"] or "system") != model):
+                    raise ValueError("Turn id already belongs to a different request")
+                if (str(existing["reasoning_effort"] or "") or None) != reasoning_effort:
                     raise ValueError("Turn id already belongs to a different request")
                 return {
                     "turn_id": turn_id,
@@ -511,9 +538,9 @@ class DesktopStore:
                 raise RuntimeError("Too many queued turns for this session")
 
             connection.execute(
-                "INSERT INTO turns (turn_id, session_id, query, status, created_at, finished_at, attachments, model) "
-                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
-                (turn_id, session_id, query, "queued", now, _json(attachments or []), model),
+                "INSERT INTO turns (turn_id, session_id, query, status, created_at, finished_at, attachments, model, reasoning_effort) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (turn_id, session_id, query, "queued", now, _json(attachments or []), model, reasoning_effort or ""),
             )
             title = str(session["title"] or "").strip() or compact_session_title(query)
             connection.execute(
@@ -546,7 +573,7 @@ class DesktopStore:
     def queued_turns(self, session_id: str) -> list[dict[str, Any]]:
         with self._lock, self._connection() as connection:
             rows = connection.execute(
-                "SELECT turn_id, query, status, created_at, attachments, model FROM turns "
+                "SELECT turn_id, query, status, created_at, attachments, model, reasoning_effort FROM turns "
                 "WHERE session_id = ? AND status = ? ORDER BY created_at ASC",
                 (session_id, "queued"),
             ).fetchall()
@@ -558,6 +585,7 @@ class DesktopStore:
                 "created_at": row["created_at"],
                 "attachments": _parse_json_list(row["attachments"]),
                 "model": str(row["model"] or "system"),
+                "reasoning_effort": str(row["reasoning_effort"] or "") or None,
             }
             for row in rows
         ]
@@ -573,7 +601,7 @@ class DesktopStore:
     def get_turn(self, turn_id: str) -> dict[str, Any] | None:
         with self._lock, self._connection() as connection:
             row = connection.execute(
-                "SELECT turn_id, session_id, query, status, created_at, finished_at, attachments, model "
+                "SELECT turn_id, session_id, query, status, created_at, finished_at, attachments, model, reasoning_effort "
                 "FROM turns WHERE turn_id = ?",
                 (turn_id,),
             ).fetchone()
@@ -604,6 +632,96 @@ class DesktopStore:
                 "UPDATE turns SET status = ?, finished_at = NULL WHERE turn_id = ?",
                 ("running", turn_id),
             )
+
+    def save_runtime_performance(
+        self,
+        session_id: str,
+        turn_id: str,
+        metrics: dict[str, Any],
+    ) -> None:
+        now = _now()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO turn_performance (
+                    turn_id, session_id, runtime_metrics, renderer_metrics, updated_at
+                ) VALUES (?, ?, ?, NULL, ?)
+                ON CONFLICT(turn_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    runtime_metrics = excluded.runtime_metrics,
+                    updated_at = excluded.updated_at
+                """,
+                (turn_id, session_id, _json(metrics), now),
+            )
+
+    def save_renderer_performance(
+        self,
+        session_id: str,
+        turn_id: str,
+        metrics: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        now = _now()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO turn_performance (
+                    turn_id, session_id, runtime_metrics, renderer_metrics, updated_at
+                ) VALUES (?, ?, NULL, ?, ?)
+                ON CONFLICT(turn_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    renderer_metrics = excluded.renderer_metrics,
+                    updated_at = excluded.updated_at
+                """,
+                (turn_id, session_id, _json(metrics), now),
+            )
+        return self.get_turn_performance(session_id, turn_id)
+
+    def get_turn_performance(
+        self,
+        session_id: str,
+        turn_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT turn_id, session_id, runtime_metrics, renderer_metrics, updated_at
+                FROM turn_performance
+                WHERE session_id = ? AND turn_id = ?
+                """,
+                (session_id, turn_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "turn_id": str(row["turn_id"]),
+            "session_id": str(row["session_id"]),
+            "runtime": _parse_json_object(row["runtime_metrics"]),
+            "renderer": _parse_json_object(row["renderer_metrics"]),
+            "updated_at": float(row["updated_at"]),
+        }
+
+    def recent_turn_performance(self, limit: int) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(100, limit))
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT turn_id, session_id, runtime_metrics, renderer_metrics, updated_at
+                FROM turn_performance
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        return [
+            {
+                "turn_id": str(row["turn_id"]),
+                "session_id": str(row["session_id"]),
+                "runtime": _parse_json_object(row["runtime_metrics"]),
+                "renderer": _parse_json_object(row["renderer_metrics"]),
+                "updated_at": float(row["updated_at"]),
+            }
+            for row in rows
+        ]
 
     def append_event(
         self,

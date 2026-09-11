@@ -3,6 +3,7 @@ import OpenCC from "opencc-js/t2cn";
 
 import {
   ArrowDown,
+  ArrowUp,
   ChevronsUpDown,
   ChevronDown,
   Database,
@@ -30,7 +31,7 @@ import { TaskHUD } from "./TaskHUD";
 import { ApprovalPanel } from "./ApprovalPanel";
 import type { Approval } from "../domains/agent";
 import type { ComposerAttachment } from "../hooks/useAgentWorkspace";
-import type { TurnModel, TurnModelOption } from "../services/agentApi";
+import type { ReasoningEffort, TurnModel, TurnModelOption } from "../services/agentApi";
 import logoUrl from "../assets/buffeed-logo.png";
 
 type AgentWorkspaceProps = {
@@ -58,6 +59,8 @@ type AgentWorkspaceProps = {
   model: TurnModel;
   modelOptions: TurnModelOption[];
   onModelChange: (model: TurnModel) => void;
+  reasoningEffort: ReasoningEffort;
+  onReasoningEffortChange: (effort: ReasoningEffort) => void;
   onToggleTrace: () => void;
   onLoadOlderHistory: () => void;
   onPromptChange: (prompt: string) => void;
@@ -251,6 +254,8 @@ export function AgentWorkspace({
   model,
   modelOptions,
   onModelChange,
+  reasoningEffort,
+  onReasoningEffortChange,
   onToggleTrace,
   onLoadOlderHistory,
   onPromptChange,
@@ -291,6 +296,8 @@ export function AgentWorkspace({
   const [voiceStatus, setVoiceStatus] = useState<string | null>(null);
   const [sessionMentionQuery, setSessionMentionQuery] = useState<string | null>(null);
   const [showModelMenu, setShowModelMenu] = useState(false);
+  const [showModelChoices, setShowModelChoices] = useState(false);
+  const [showEffortMenu, setShowEffortMenu] = useState(false);
   const [expandedAttachment, setExpandedAttachment] = useState<{
     name: string;
     kind: "image" | "video";
@@ -485,15 +492,35 @@ export function AgentWorkspace({
     const composerElement = composerContainerRef.current;
     if (!messagesElement || !composerElement) return undefined;
     const syncComposerSpace = () => {
-      const reservedHeight = Math.ceil(composerElement.getBoundingClientRect().height + 24);
+      const regionElement = messagesElement.parentElement;
+      const regionBottom = regionElement?.getBoundingClientRect().bottom
+        ?? composerElement.getBoundingClientRect().bottom;
+      const floatingElements = composerElement.querySelectorAll<HTMLElement>(
+        ".composer-task-hud, .detail-section, .steer-confirmation",
+      );
+      const topEdge = Array.from(floatingElements).reduce(
+        (currentTop, element) => {
+          const bounds = element.getBoundingClientRect();
+          return bounds.width > 0 && bounds.height > 0
+            ? Math.min(currentTop, bounds.top)
+            : currentTop;
+        },
+        composerElement.getBoundingClientRect().top,
+      );
+      const reservedHeight = Math.ceil(Math.max(0, regionBottom - topEdge) + 24);
       messagesElement.style.setProperty("--composer-reserved-height", `${reservedHeight}px`);
+      regionElement?.style.setProperty("--composer-reserved-height", `${reservedHeight}px`);
     };
     const observer = new ResizeObserver(syncComposerSpace);
     observer.observe(composerElement);
+    composerElement.querySelectorAll<HTMLElement>(
+      ".composer-task-hud, .detail-section, .steer-confirmation",
+    ).forEach((element) => observer.observe(element));
     syncComposerSpace();
     return () => {
       observer.disconnect();
       messagesElement.style.removeProperty("--composer-reserved-height");
+      messagesElement.parentElement?.style.removeProperty("--composer-reserved-height");
     };
   }, [activeSessionId]);
 
@@ -610,18 +637,20 @@ export function AgentWorkspace({
   }, []);
 
   useEffect(() => {
-    if (!showAttachmentMenu && sessionMentionQuery === null && !showModelMenu) return undefined;
+    if (!showAttachmentMenu && sessionMentionQuery === null && !showModelMenu && !showModelChoices && !showEffortMenu) return undefined;
     const handleOutsidePointerDown = (event: globalThis.PointerEvent) => {
       const target = event.target;
-      if (target instanceof Element && target.closest(".composer-attach-wrap, .session-mention-menu, .composer-model-button, .composer-model-menu")) return;
+      if (target instanceof Element && target.closest(".composer-attach-wrap, .session-mention-menu, .composer-model-button, .composer-model-menu, .composer-effort-button, .composer-effort-menu")) return;
       setShowAttachmentMenu(false);
       setSessionMentionQuery(null);
       setShowModelMenu(false);
+      setShowModelChoices(false);
+      setShowEffortMenu(false);
       window.requestAnimationFrame(() => attachmentTriggerRef.current?.focus());
     };
     document.addEventListener("pointerdown", handleOutsidePointerDown, true);
     return () => document.removeEventListener("pointerdown", handleOutsidePointerDown, true);
-  }, [sessionMentionQuery, showAttachmentMenu, showModelMenu]);
+  }, [sessionMentionQuery, showAttachmentMenu, showEffortMenu, showModelChoices, showModelMenu]);
 
   const mentionSessions = useMemo(() => {
     if (sessionMentionQuery === null) return [];
@@ -632,6 +661,8 @@ export function AgentWorkspace({
       .slice(0, 8);
   }, [activeSessionId, sessionMentionQuery, sessions]);
   const selectedModelLabel = modelOptions.find((item) => item.id === model)?.label ?? model;
+  const selectedModel = modelOptions.find((item) => item.id === model);
+  const canChooseReasoningEffort = (selectedModel?.reasoning_efforts.length ?? 0) > 0;
 
   return (
     <section className="conversation-panel">
@@ -719,12 +750,6 @@ export function AgentWorkspace({
                   onPreviewAttachment={openMediaPreview}
                 />
               ))}
-              {group.turnId && activeTurnId === group.turnId && (
-                <div className="turn-running-indicator" role="status" aria-label="当前回合正在执行">
-                  <LoaderCircle className="spin" size={14} aria-hidden="true" />
-                  <span>正在执行</span>
-                </div>
-              )}
               {group.turnId && turnEvents.length > 0 && (
                 <ExecutionTrace
                   events={turnEvents}
@@ -779,7 +804,6 @@ export function AgentWorkspace({
             <div className="processing-line" role="status" aria-live="polite">
               <span className="thinking-text">正在思考...</span>
               {turnPhase && <span className="processing-phase">{turnPhase}</span>}
-              {turnElapsedSeconds !== null && <time>耗时 {durationLabel(turnElapsedSeconds)}</time>}
             </div>
           )}
         </div>
@@ -949,14 +973,35 @@ export function AgentWorkspace({
               title="切换模型"
               aria-label="切换模型"
               aria-expanded={showModelMenu}
-              onClick={() => setShowModelMenu((visible) => !visible)}
+              onClick={() => { setShowModelChoices(false); setShowEffortMenu(false); setShowModelMenu((visible) => !visible); }}
               disabled={turnSubmitting || Boolean(pendingSteerText)}
             >
-              <span>{selectedModelLabel}</span>
+              <span className="composer-model-name">{selectedModelLabel}</span>
+              {canChooseReasoningEffort ? <><span className="composer-model-separator">·</span><span className="composer-effort-name">{reasoningEffort}</span></> : null}
               <ChevronDown size={14} />
             </button>
-            {showModelMenu ? <div className="composer-model-menu" role="menu" aria-label="选择模型">
-              {modelOptions.map((item) => <button className={model === item.id ? "is-active" : ""} key={item.id} type="button" role="menuitem" onClick={() => { onModelChange(item.id); setShowModelMenu(false); }}>{item.label}</button>)}
+            {showModelMenu ? <div className="composer-model-menu composer-settings-menu" role="menu" aria-label="模型和思考强度">
+              <button className="composer-menu-choice" type="button" role="menuitem" onClick={() => { setShowEffortMenu(false); setShowModelChoices((visible) => !visible); }}>
+                <span>模型</span><strong>{selectedModelLabel}</strong><ChevronDown size={13} className={showModelChoices ? "is-open" : ""} />
+              </button>
+              {showModelChoices ? <div className="composer-submenu" role="group" aria-label="选择模型">
+                {modelOptions.map((item) => <button className={model === item.id ? "is-active" : ""} key={item.id} type="button" role="menuitem" onClick={() => { onModelChange(item.id); setShowModelChoices(false); }}>{item.label}</button>)}
+              </div> : null}
+              <button
+                className="composer-menu-choice"
+                type="button"
+                role="menuitem"
+                aria-disabled={!canChooseReasoningEffort}
+                onClick={() => { if (canChooseReasoningEffort) { setShowModelChoices(false); setShowEffortMenu((visible) => !visible); } }}
+                disabled={turnSubmitting || Boolean(pendingSteerText) || !canChooseReasoningEffort}
+              >
+                <span>思考强度</span><strong>{canChooseReasoningEffort ? reasoningEffort : "不适用"}</strong><ChevronDown size={13} className={showEffortMenu ? "is-open" : ""} />
+              </button>
+              {showEffortMenu && canChooseReasoningEffort ? <div className="composer-submenu" role="group" aria-label="选择思考强度">
+                {(["light", "medium", "high", "xhigh"] as const).map((effort) => (
+                  <button className={reasoningEffort === effort ? "is-active" : ""} key={effort} type="button" role="menuitem" onClick={() => { onReasoningEffortChange(effort); setShowEffortMenu(false); }}>{effort}</button>
+                ))}
+              </div> : null}
             </div> : null}
             <button
               className={`primary-button send-button ${activeTurnId ? "is-stop" : ""}`}
@@ -965,7 +1010,7 @@ export function AgentWorkspace({
               onClick={() => void (activeTurnId ? onCancelTurn() : onSendTurn())}
               disabled={activeTurnId ? false : (!prompt.trim() && attachments.length === 0) || !activeSessionId || turnSubmitting || Boolean(pendingSteerText)}
             >
-              {activeTurnId ? <><Square size={16} fill="currentColor" /> 停止</> : <><SendHorizontal size={17} /> 发送</>}
+              {activeTurnId ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} strokeWidth={2.5} />}
             </button>
           </div>
         </div>

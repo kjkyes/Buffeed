@@ -22,10 +22,12 @@ import {
   importSessionHistory,
   listModels,
   listSessions,
+  reportRendererTurnPerformance,
   resolveApprovalRequest,
   type TurnAttachment,
   type TurnModel,
   type TurnModelOption,
+  type ReasoningEffort,
 } from "../services/agentApi";
 
 type UseAgentWorkspaceOptions = {
@@ -48,6 +50,14 @@ type ComposerDraft = {
   attachments: ComposerAttachment[];
 };
 
+type ClientTurnPerformance = {
+  sessionId: string;
+  submittedAt: number;
+  firstSseDeltaAt?: number;
+  firstPaintAt?: number;
+  reported: boolean;
+};
+
 const NEW_CONVERSATION_DRAFT_KEY = "__new_conversation__";
 const MAX_PERSISTED_ATTACHMENT_PREVIEW_URL_CHARS = 750_000;
 
@@ -65,6 +75,29 @@ const FOLDED_LIFECYCLE_EVENTS = new Set(["model.requested", "turn.completed"]);
 // Runtime restoration and first-use model setup can exceed the normal request latency.
 const TURN_SUBMIT_TIMEOUT_MS = 20_000;
 const ATTACHMENT_CONTEXT_MARKER = "[附件上下文]";
+const DEFAULT_MODEL_OPTIONS: TurnModelOption[] = [
+  ...(["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra"] as const).map((id) => ({
+    id,
+    label: id,
+    provider: "anthropic-compatible",
+    supports_video: false,
+    reasoning_efforts: ["light", "medium", "high", "xhigh"] as ReasoningEffort[],
+  })),
+  {
+    id: "qwen3.8-max",
+    label: "qwen3.8-max",
+    provider: "dashscope",
+    supports_video: true,
+    reasoning_efforts: [],
+  },
+  {
+    id: "qwen3.8-flash",
+    label: "qwen3.8-flash",
+    provider: "dashscope",
+    supports_video: false,
+    reasoning_efforts: [],
+  },
+];
 
 function displayQuery(query: string): string {
   const markerIndex = query.indexOf(`\n\n${ATTACHMENT_CONTEXT_MARKER}`);
@@ -90,13 +123,11 @@ export function useAgentWorkspace({
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
-  const [model, setModel] = useState<TurnModel>(() => localStorage.getItem("buffeed.model")?.trim() || "system");
-  const [modelOptions, setModelOptions] = useState<TurnModelOption[]>([{
-    id: "system",
-    label: "系统模型",
-    provider: "system",
-    supports_video: false,
-  }]);
+  const [model, setModel] = useState<TurnModel>(() => localStorage.getItem("buffeed.model")?.trim() || DEFAULT_MODEL_OPTIONS[0].id);
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(
+    () => (localStorage.getItem("buffeed.reasoning-effort") as ReasoningEffort | null) || "high",
+  );
+  const [modelOptions, setModelOptions] = useState<TurnModelOption[]>(DEFAULT_MODEL_OPTIONS);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const [agentHealthy, setAgentHealthy] = useState<boolean | null>(null);
   const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null);
@@ -117,6 +148,7 @@ export function useAgentWorkspace({
     query: string;
     attachments: ChatAttachment[];
   } | null>(null);
+  const clientTurnPerformanceRef = useRef<Record<string, ClientTurnPerformance>>({});
   const activeTurnRef = useRef<string | null>(activeTurnId);
   activeTurnRef.current = activeTurnId;
 
@@ -202,16 +234,25 @@ export function useAgentWorkspace({
 
   const refreshModels = useCallback(async (baseUrl = agentApi) => {
     const response = await listModels(baseUrl);
-    const available = response.models.length > 0 ? response.models : [{
-      id: "system",
-      label: "系统模型",
-      provider: "system",
-      supports_video: false,
-    }];
+    const available = response.models.length > 0 ? response.models : DEFAULT_MODEL_OPTIONS;
     setModelOptions(available);
+    const configuredEffort = response.default_reasoning_effort || "high";
+    setReasoningEffort((current) => {
+      const stored = localStorage.getItem("buffeed.reasoning-effort") as ReasoningEffort | null;
+      const preferred = stored || current || configuredEffort;
+      const next = ["light", "medium", "high", "xhigh"].includes(preferred)
+        ? preferred
+        : configuredEffort;
+      localStorage.setItem("buffeed.reasoning-effort", next);
+      return next;
+    });
     setModel((current) => {
       const stored = localStorage.getItem("buffeed.model")?.trim();
-      const preferred = stored && available.some((item) => item.id === stored) ? stored : current;
+      const preferred = stored && available.some((item) => item.id === stored)
+        ? stored
+        : available.some((item) => item.id === current)
+          ? current
+        : response.default_model || available[0].id;
       const next = available.some((item) => item.id === preferred) ? preferred : available[0].id;
       localStorage.setItem("buffeed.model", next);
       return next;
@@ -268,6 +309,29 @@ export function useAgentWorkspace({
     setPendingSteerText(null);
     setStatusMessage("当前回合已结束，追加消息已放回输入框");
   }, [activeTurnId, pendingSteerText, setStatusMessage]);
+
+  const measureFirstStreamPaint = useCallback((turnId: string | null) => {
+    if (!turnId) return;
+    const measurement = clientTurnPerformanceRef.current[turnId];
+    if (!measurement || measurement.firstSseDeltaAt !== undefined) return;
+    measurement.firstSseDeltaAt = performance.now();
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const current = clientTurnPerformanceRef.current[turnId];
+        if (!current || current.reported || current.firstSseDeltaAt === undefined) return;
+        current.firstPaintAt = performance.now();
+        current.reported = true;
+        void reportRendererTurnPerformance(agentApi, current.sessionId, turnId, {
+          schema_version: 1,
+          submit_to_sse_first_delta_ms: Number((current.firstSseDeltaAt - current.submittedAt).toFixed(2)),
+          submit_to_first_paint_ms: Number((current.firstPaintAt - current.submittedAt).toFixed(2)),
+          sse_first_delta_to_first_paint_ms: Number((current.firstPaintAt - current.firstSseDeltaAt).toFixed(2)),
+        }).finally(() => {
+          delete clientTurnPerformanceRef.current[turnId];
+        });
+      });
+    });
+  }, [agentApi]);
 
   const consumeEvent = useCallback((streamEvent: StreamEvent) => {
     if (FOLDED_LIFECYCLE_EVENTS.has(streamEvent.type)) return;
@@ -374,6 +438,9 @@ export function useAgentWorkspace({
       const streamDelta = streamEvent.payload.delta !== undefined
         ? String(streamEvent.payload.delta ?? "")
         : String(streamEvent.payload.text ?? "");
+      if (assistantPhase === "streaming" && streamDelta) {
+        measureFirstStreamPaint(streamEvent.turnId);
+      }
       if (streamId) {
         setMessages((current) => {
           if (streamRetracted) {
@@ -440,9 +507,13 @@ export function useAgentWorkspace({
       setActiveTurnId(null);
       setTurnSubmitting(false);
       setTraceExpanded(false);
+      const completedTurnId = streamEvent.turnId;
+      if (completedTurnId && !clientTurnPerformanceRef.current[completedTurnId]?.firstSseDeltaAt) {
+        delete clientTurnPerformanceRef.current[completedTurnId];
+      }
       void refreshSessions();
     }
-  }, [activeSessionId, activeTurnId, onTeamEvent, refreshSessions]);
+  }, [activeSessionId, activeTurnId, measureFirstStreamPaint, onTeamEvent, refreshSessions]);
 
   useEffect(() => {
     const currentTurnId = activeTurnRef.current;
@@ -483,6 +554,7 @@ export function useAgentWorkspace({
     setClockNow(Date.now() / 1000);
     setTraceExpanded(true);
     pendingTurnRef.current = null;
+    clientTurnPerformanceRef.current = {};
     setPrompt(draft?.prompt ?? "");
     setAttachments(draft?.attachments.map((item) => ({ ...item })) ?? []);
   }, [activeSessionId, draftKey]);
@@ -599,6 +671,11 @@ export function useAgentWorkspace({
     const pendingAttachments = attachments;
     const originalPrompt = prompt.trim();
     const clientTurnId = `client:${requestId}`;
+    clientTurnPerformanceRef.current[requestId] = {
+      sessionId: activeSessionId,
+      submittedAt: performance.now(),
+      reported: false,
+    };
     pendingTurnRef.current = {
       clientTurnId,
       turnId: requestId,
@@ -655,6 +732,7 @@ export function useAgentWorkspace({
           context: item.context,
         })),
         model,
+        reasoningEffort,
       );
       const pending = pendingTurnRef.current;
       if (pending?.clientTurnId === clientTurnId) {
@@ -722,6 +800,7 @@ export function useAgentWorkspace({
       if (pendingTurnRef.current?.clientTurnId === clientTurnId) {
         pendingTurnRef.current = null;
       }
+      delete clientTurnPerformanceRef.current[requestId];
       setTurnSubmitting(false);
       setTurnStartedAt(null);
       setTurnFinishedAt(null);
@@ -839,7 +918,9 @@ export function useAgentWorkspace({
     attachments,
     model,
     modelOptions,
+    reasoningEffort,
     setModel: (nextModel: TurnModel) => { localStorage.setItem("buffeed.model", nextModel); setModel(nextModel); },
+    setReasoningEffort: (nextEffort: ReasoningEffort) => { localStorage.setItem("buffeed.reasoning-effort", nextEffort); setReasoningEffort(nextEffort); },
     addInputFiles,
     addClipboardImage,
     addSessionHistory,

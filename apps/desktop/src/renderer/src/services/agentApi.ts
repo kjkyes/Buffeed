@@ -34,6 +34,13 @@ export type TurnStatusResponse = {
   finished_at: number | null;
 };
 
+export type RendererPerformanceRequest = {
+  schema_version: 1;
+  submit_to_sse_first_delta_ms: number;
+  submit_to_first_paint_ms: number;
+  sse_first_delta_to_first_paint_ms: number;
+};
+
 export type ApprovalResolutionResponse = {
   approval_id: string;
   approved: boolean;
@@ -109,13 +116,20 @@ export function uninstallPlugin(baseUrl: string, request: PluginUninstallRequest
 
 export type TurnDelivery = "queue" | "steer";
 export type TurnModel = string;
+export type ReasoningEffort = "light" | "medium" | "high" | "xhigh";
 export type TurnModelOption = {
   id: TurnModel;
   label: string;
   provider: string;
   supports_video: boolean;
+  reasoning_efforts: ReasoningEffort[];
 };
-export type ModelsResponse = { models: TurnModelOption[] };
+export type ModelsResponse = {
+  models: TurnModelOption[];
+  default_model: TurnModel;
+  reasoning_efforts: ReasoningEffort[];
+  default_reasoning_effort: ReasoningEffort;
+};
 export type TurnAttachment = {
   path?: string;
   name: string;
@@ -167,6 +181,8 @@ export type ChangeFile = {
 };
 
 export type ChangeSnapshot = {
+  turn_id: string | null;
+  attribution: "agent_tool";
   available: boolean;
   files: ChangeFile[];
   total_files: number;
@@ -240,10 +256,11 @@ export function createTurnRequest(
   signal?: AbortSignal,
   attachments: TurnAttachment[] = [],
   model: TurnModel = "system",
+  reasoningEffort: ReasoningEffort = "high",
 ): Promise<CreateTurnResponse> {
   return api<CreateTurnResponse>(baseUrl, `/api/v1/sessions/${sessionId}/turns`, {
     method: "POST",
-    body: JSON.stringify({ query, delivery, request_id: requestId, attachments, model }),
+    body: JSON.stringify({ query, delivery, request_id: requestId, attachments, model, reasoning_effort: reasoningEffort }),
     signal,
   });
 }
@@ -258,6 +275,22 @@ export function getTurnStatusRequest(
     baseUrl,
     `/api/v1/sessions/${sessionId}/turns/${encodeURIComponent(turnId)}`,
     { signal },
+  );
+}
+
+export function reportRendererTurnPerformance(
+  baseUrl: string,
+  sessionId: string,
+  turnId: string,
+  metrics: RendererPerformanceRequest,
+): Promise<Record<string, unknown>> {
+  return api<Record<string, unknown>>(
+    baseUrl,
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/performance/renderer`,
+    {
+      method: "POST",
+      body: JSON.stringify(metrics),
+    },
   );
 }
 

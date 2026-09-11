@@ -197,6 +197,12 @@ def configured_dashscope_video_models() -> tuple[str, ...]:
     return tuple(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
+def configured_dashscope_models() -> tuple[str, ...]:
+    raw = os.getenv("DASHSCOPE_MODELS", "").strip()
+    values = raw.split(",") if raw else ["qwen3.8-max", "qwen3.8-flash"]
+    return tuple(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
 def _messages_contain_multimodal_video(messages: list[dict[str, Any]]) -> bool:
     for message in messages:
         if str(message.get("role") or "") != "user":
@@ -5189,9 +5195,10 @@ def call_llm(
     max_tokens: int,
     text_sink: Callable[[str, str, bool], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[Any, str | None]:
     system = assemble_system_prompt(context)
-    if state.current_model in configured_dashscope_video_models():
+    if state.current_model in configured_dashscope_models():
         return _dashscope_call(
             system,
             messages,
@@ -5205,6 +5212,11 @@ def call_llm(
 
     def request():
         nonlocal stream_id
+        provider_options = (
+            {"extra_body": {"reasoning_effort": reasoning_effort}}
+            if reasoning_effort
+            else {}
+        )
         if text_sink is None:
             return client.messages.create(
                 model=state.current_model,
@@ -5212,6 +5224,7 @@ def call_llm(
                 messages=messages,
                 tools=tools,
                 max_tokens=max_tokens,
+                **provider_options,
             )
         stream_id = str(uuid.uuid4())
         try:
@@ -5221,6 +5234,7 @@ def call_llm(
                 messages=messages,
                 tools=tools,
                 max_tokens=max_tokens,
+                **provider_options,
             ) as stream:
                 for delta in stream.text_stream:
                     if delta:
@@ -5234,6 +5248,22 @@ def call_llm(
     return response, stream_id
 
 
+def _response_output_tokens(response: Any) -> int | None:
+    """Read provider usage when it is available without assuming a tokenizer."""
+    usage = getattr(response, "usage", None)
+    if isinstance(usage, dict):
+        value = usage.get("output_tokens", usage.get("completion_tokens"))
+    else:
+        value = getattr(usage, "output_tokens", None)
+        if value is None:
+            value = getattr(usage, "completion_tokens", None)
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError):
+        return None
+    return tokens if tokens >= 0 else None
+
+
 @dataclass
 class AgentLoopCallbacks:
     """Optional adapters for non-terminal callers of the core agent loop."""
@@ -5242,6 +5272,7 @@ class AgentLoopCallbacks:
     is_cancelled: Callable[[], bool] | None = None
     interjection_provider: Callable[[], list[dict[str, Any]]] | None = None
     interjection_fallback: Callable[[list[dict[str, Any]]], None] | None = None
+    model_usage_sink: Callable[[int | None], None] | None = None
     allow_background: bool = True
     permission_interactive: bool = True
 
@@ -5380,7 +5411,11 @@ def _dashscope_response(payload: dict[str, Any]) -> Any:
             arguments = {}
         blocks.append(SimpleNamespace(type="tool_use", id=str(call.get("id") or uuid.uuid4().hex), name=str(function.get("name") or ""), input=arguments if isinstance(arguments, dict) else {}))
     finish_reason = choice.get("finish_reason")
-    return SimpleNamespace(content=blocks, stop_reason="max_tokens" if finish_reason == "length" else finish_reason)
+    return SimpleNamespace(
+        content=blocks,
+        stop_reason="max_tokens" if finish_reason == "length" else finish_reason,
+        usage=payload.get("usage"),
+    )
 
 
 def _dashscope_call(
@@ -5393,7 +5428,7 @@ def _dashscope_call(
     is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[Any, str | None]:
     if not DASHSCOPE_API_KEY:
-        raise RuntimeError("未配置 DASHSCOPE_API_KEY，无法调用百炼视频模型")
+        raise RuntimeError("未配置 DASHSCOPE_API_KEY，无法调用百炼模型")
     endpoint = f"{DASHSCOPE_BASE_URL}/chat/completions"
     payload: dict[str, Any] = {"model": model, "messages": _dashscope_messages(system, messages), "max_tokens": max_tokens, "stream": bool(text_sink)}
     if tools:
@@ -5411,6 +5446,7 @@ def _dashscope_call(
         stream_id = str(uuid.uuid4())
         text_parts: list[str] = []
         tool_parts: dict[int, dict[str, str]] = {}
+        usage: dict[str, Any] | None = None
         with httpx.stream("POST", endpoint, headers=headers, json=payload, timeout=timeout) as response:
             if response.status_code >= 400:
                 raise RuntimeError(f"百炼请求失败 HTTP {response.status_code}: {response.read().decode('utf-8', 'replace')[:2000]}")
@@ -5426,6 +5462,8 @@ def _dashscope_call(
                     chunk = json.loads(raw)
                 except ValueError:
                     continue
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
                 delta = ((chunk.get("choices") or [{}])[0] or {}).get("delta") or {}
                 delta_text = delta.get("content")
                 if isinstance(delta_text, str) and delta_text:
@@ -5444,7 +5482,10 @@ def _dashscope_call(
         raise
     message: dict[str, Any] = {"content": "".join(text_parts), "tool_calls": [{"id": item["id"], "function": {"name": item["name"], "arguments": item["arguments"]}} for item in tool_parts.values()]}
     finish_reason = "tool_calls" if tool_parts else "stop"
-    return _dashscope_response({"choices": [{"message": message, "finish_reason": finish_reason}]}), stream_id
+    return _dashscope_response({
+        "choices": [{"message": message, "finish_reason": finish_reason}],
+        "usage": usage,
+    }), stream_id
 
 
 def _run_video_understanding(
@@ -5637,6 +5678,7 @@ def agent_loop(
     callbacks: AgentLoopCallbacks | None = None,
     disabled_tools: set[str] | None = None,
     model: str | None = None,
+    reasoning_effort: str | None = None,
 ):
     callbacks = callbacks or AgentLoopCallbacks()
     rounds_since_todo = int(context.get("_rounds_since_todo", 0))
@@ -5728,7 +5770,14 @@ def agent_loop(
                 max_tokens,
                 text_sink=emit_stream_text if callbacks.event_sink is not None else None,
                 is_cancelled=callbacks.is_cancelled,
+                reasoning_effort=reasoning_effort,
             )
+            if callbacks.model_usage_sink is not None:
+                try:
+                    callbacks.model_usage_sink(_response_output_tokens(response))
+                except Exception:
+                    # Performance observation must not alter the model turn.
+                    pass
         except Exception as e:
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages, context)
@@ -5908,11 +5957,13 @@ class AgentSession:
         *,
         attachments: list[dict[str, Any]] | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         event_sink: Callable[[str, dict[str, Any]], None] | None = None,
         approval_resolver: Callable[[Any], bool] | None = None,
         is_cancelled: Callable[[], bool] | None = None,
         interjection_provider: Callable[[], list[dict[str, Any]]] | None = None,
         interjection_fallback: Callable[[list[dict[str, Any]]], None] | None = None,
+        model_usage_sink: Callable[[int | None], None] | None = None,
         allow_background: bool = True,
     ) -> dict[str, Any]:
         normalized_query = query.strip()
@@ -5935,6 +5986,7 @@ class AgentSession:
             is_cancelled=is_cancelled,
             interjection_provider=interjection_provider,
             interjection_fallback=interjection_fallback,
+            model_usage_sink=model_usage_sink,
             allow_background=allow_background,
             permission_interactive=False,
         )
@@ -6046,6 +6098,7 @@ class AgentSession:
                     callbacks=callbacks,
                     disabled_tools=turn_disabled_tools,
                     model=PRIMARY_MODEL if has_multimodal_video else model,
+                    reasoning_effort=reasoning_effort,
                 )
             finally:
                 self.context["disabled_tools"] = sorted(self.disabled_tools)

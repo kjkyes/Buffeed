@@ -29,7 +29,9 @@ function snapshotFromEvent(event: StreamEvent): ChangeSnapshot | null {
     return null;
   }
   const snapshot = value as Partial<ChangeSnapshot>;
-  return Array.isArray(snapshot.files)
+  return snapshot.attribution === "agent_tool"
+    && snapshot.turn_id === event.turnId
+    && Array.isArray(snapshot.files)
     ? snapshot as ChangeSnapshot
     : null;
 }
@@ -95,9 +97,17 @@ export function useTaskHUD({
       fileChangesRef.current = [];
       return;
     }
+    if (!requestedTurnId) {
+      setFileChanges([]);
+      fileChangesRef.current = [];
+      return;
+    }
     try {
       const response = await getSessionChanges(agentApi, sessionId);
       if (currentSessionIdRef.current !== requestedSessionId) {
+        return;
+      }
+      if (response.attribution !== "agent_tool" || response.turn_id !== requestedTurnId) {
         return;
       }
       const files = response.files;

@@ -190,6 +190,8 @@ export default function App() {
           model={agent.model}
           modelOptions={agent.modelOptions}
           onModelChange={agent.setModel}
+          reasoningEffort={agent.reasoningEffort}
+          onReasoningEffortChange={agent.setReasoningEffort}
           onToggleTrace={() => agent.setTraceExpanded((expanded) => !expanded)}
           onLoadOlderHistory={agent.loadOlderHistory}
           onPromptChange={agent.setPrompt}
