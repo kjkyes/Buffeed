@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import OpenCC from "opencc-js/t2cn";
 
 import {
@@ -22,7 +23,7 @@ import {
 } from "lucide-react";
 
 import type { ChatAttachment, ChatMessage, Session, StreamEvent } from "../domains/agent";
-import { deriveTaskHUD, type TaskHUDState } from "../domains/hud";
+import { deriveTaskHUD, terminalPhase, type HUDOperation, type TaskHUDState } from "../domains/hud";
 import { durationLabel, turnTimeLabel } from "../utils/format";
 import { CopyButton } from "./CopyButton";
 import { ExecutionTrace } from "./ExecutionTrace";
@@ -42,11 +43,11 @@ type AgentWorkspaceProps = {
   activeSessionId: string | null;
   approvals: Approval[];
   messages: ChatMessage[];
+  streamingMessageIds: ReadonlySet<string>;
+  streamingPreviewOrders: Readonly<Record<string, number>>;
   latestConversationTurnId: string | null;
   latestConversationEvents: StreamEvent[];
   conversationEvents: StreamEvent[];
-  hasOlderHistory: boolean;
-  loadingOlderHistory: boolean;
   taskHUD: TaskHUDState;
   taskHUDByTurn: Record<string, TaskHUDState>;
   activeTurnId: string | null;
@@ -62,7 +63,6 @@ type AgentWorkspaceProps = {
   reasoningEffort: ReasoningEffort;
   onReasoningEffortChange: (effort: ReasoningEffort) => void;
   onToggleTrace: () => void;
-  onLoadOlderHistory: () => void;
   onPromptChange: (prompt: string) => void;
   onCreateSession: () => void | Promise<void>;
   attachments: ComposerAttachment[];
@@ -88,6 +88,8 @@ const COMPOSER_MIN_HEIGHT = 48;
 const COMPOSER_AUTO_MAX_HEIGHT = 128;
 const COMPOSER_HEIGHT_STORAGE_KEY = "buffeed.composer-height";
 const MESSAGE_BOTTOM_THRESHOLD = 24;
+const EMPTY_EVENTS: StreamEvent[] = [];
+const NOOP = () => undefined;
 
 type ComposerResizeState = {
   pointerId: number;
@@ -176,7 +178,7 @@ function formatVoiceError(error: unknown): string {
   return detail || "未知错误";
 }
 
-function UserMessage({
+const UserMessage = memo(function UserMessage({
   text,
   highlighted,
   attachments,
@@ -227,7 +229,142 @@ function UserMessage({
       )}
     </article>
   );
+});
+
+const StreamingMessage = memo(function StreamingMessage({ text }: { text: string }) {
+  return <div className="streaming-message" aria-live="polite">{text}</div>;
+});
+
+type AssistantMessageProps = {
+  message: ChatMessage;
+  isLatestTurn: boolean;
+  isStreaming: boolean;
+  showTaskHUD: boolean;
+  showActions: boolean;
+  turnId: string | null;
+  turnTimestamp: number | null;
+  taskHUDState?: TaskHUDState;
+  onRevertChanges: () => void | Promise<void>;
+  onReviewChanges: (turnId?: string, path?: string) => void | Promise<void>;
+  onForkTurn: (turnId: string) => void | Promise<void>;
+};
+
+function sameTaskHUDState(previous: TaskHUDState | undefined, next: TaskHUDState | undefined): boolean {
+  if (!previous || !next) return previous === next;
+  const previousSummary = previous.summary;
+  const nextSummary = next.summary;
+  return previous.phase === next.phase
+    && previous.currentStep === next.currentStep
+    && previous.totalSteps === next.totalSteps
+    && previous.cancellationNote === next.cancellationNote
+    && previous.fileChanges.length === next.fileChanges.length
+    && previous.fileChanges.every((file, index) => {
+      const nextFile = next.fileChanges[index];
+      if (!nextFile
+        || file.path !== nextFile.path
+        || file.additions !== nextFile.additions
+        || file.deletions !== nextFile.deletions
+        || file.status !== nextFile.status
+        || file.hunks.length !== nextFile.hunks.length
+        || (file.diffLines?.length ?? 0) !== (nextFile.diffLines?.length ?? 0)) {
+        return false;
+      }
+      return file.hunks.every((hunk, hunkIndex) => {
+        const nextHunk = nextFile.hunks[hunkIndex];
+        return hunk.startLine === nextHunk?.startLine && hunk.endLine === nextHunk?.endLine;
+      }) && (file.diffLines ?? []).every((line, lineIndex) => {
+        const nextLine = nextFile.diffLines?.[lineIndex];
+        return line.kind === nextLine?.kind
+          && line.oldLine === nextLine?.oldLine
+          && line.newLine === nextLine?.newLine
+          && line.text === nextLine?.text;
+      });
+    })
+    && previous.operations.length === next.operations.length
+    && previous.operations.every((operation, index) => {
+      const nextOperation = next.operations[index];
+      return operation.id === nextOperation?.id
+        && operation.status === nextOperation.status
+        && operation.resultEventId === nextOperation.resultEventId
+        && operation.durationSeconds === nextOperation.durationSeconds
+        && operation.detail === nextOperation.detail;
+    })
+    && previousSummary?.totalFiles === nextSummary?.totalFiles
+    && previousSummary?.totalAdditions === nextSummary?.totalAdditions
+    && previousSummary?.totalDeletions === nextSummary?.totalDeletions;
 }
+
+function assistantMessageEqual(previous: AssistantMessageProps, next: AssistantMessageProps): boolean {
+  return previous.message === next.message
+    && previous.isLatestTurn === next.isLatestTurn
+    && previous.isStreaming === next.isStreaming
+    && previous.showTaskHUD === next.showTaskHUD
+    && previous.showActions === next.showActions
+    && previous.turnId === next.turnId
+    && previous.turnTimestamp === next.turnTimestamp
+    && sameTaskHUDState(previous.taskHUDState, next.taskHUDState);
+}
+
+const AssistantMessage = memo(function AssistantMessage({
+  message,
+  isLatestTurn,
+  isStreaming,
+  showTaskHUD,
+  showActions,
+  turnId,
+  turnTimestamp,
+  taskHUDState,
+  onRevertChanges,
+  onReviewChanges,
+  onForkTurn,
+}: AssistantMessageProps) {
+  const handleReview = useCallback((path?: string) => {
+    void onReviewChanges(turnId ?? undefined, path);
+  }, [onReviewChanges, turnId]);
+  const handleFork = useCallback(() => {
+    if (turnId) void onForkTurn(turnId);
+  }, [onForkTurn, turnId]);
+  return (
+    <article className={`message ${message.role} ${isLatestTurn ? "latest-turn" : ""}`}>
+      {message.recovered && (
+        <div className="message-recovery-note" role="status">
+          运行时重启，以下为已保存的部分回答；本回合已中断
+        </div>
+      )}
+      <div className="message-content">
+        {isStreaming ? <StreamingMessage text={message.text} /> : <MarkdownContent text={message.text} />}
+      </div>
+      {showTaskHUD && taskHUDState?.summary && (
+        <div className="message-summary-hud">
+          <TaskHUD
+            state={taskHUDState}
+            variant="summary"
+            enabled
+            onRevert={onRevertChanges}
+            onReview={handleReview}
+          />
+        </div>
+      )}
+      {showActions && (
+        <div className="message-copy-row message-copy-row-assistant assistant-action-row">
+          <CopyButton text={message.text} label="复制回复" className="message-copy-button" />
+          {turnId && (
+            <button
+              className="message-copy-button fork-button"
+              type="button"
+              title="Fork 当前回合"
+              aria-label="Fork 当前回合"
+              onClick={handleFork}
+            >
+              <GitFork size={14} />
+            </button>
+          )}
+          {turnTimestamp !== null && <time className="message-turn-time">{turnTimeLabel(turnTimestamp)}</time>}
+        </div>
+      )}
+    </article>
+  );
+}, assistantMessageEqual);
 
 export function AgentWorkspace({
   theme,
@@ -237,11 +374,11 @@ export function AgentWorkspace({
   activeSessionId,
   approvals,
   messages,
+  streamingMessageIds,
+  streamingPreviewOrders,
   latestConversationTurnId,
   latestConversationEvents,
   conversationEvents,
-  hasOlderHistory,
-  loadingOlderHistory,
   taskHUD,
   taskHUDByTurn,
   activeTurnId,
@@ -257,7 +394,6 @@ export function AgentWorkspace({
   reasoningEffort,
   onReasoningEffortChange,
   onToggleTrace,
-  onLoadOlderHistory,
   onPromptChange,
   onCreateSession,
   attachments,
@@ -283,7 +419,6 @@ export function AgentWorkspace({
   const modelTriggerRef = useRef<HTMLButtonElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const composerContainerRef = useRef<HTMLElement>(null);
-  const turnRefs = useRef(new Map<string, HTMLDivElement>());
   const composerResizeRef = useRef<ComposerResizeState | null>(null);
   const composerManualHeightRef = useRef(false);
   const [traceExpandedByTurn, setTraceExpandedByTurn] = useState<Record<string, boolean>>({});
@@ -311,6 +446,21 @@ export function AgentWorkspace({
   } | null>(null);
   const voiceRecorderRef = useRef<VoiceRecorderState | null>(null);
   const highlightTimerRef = useRef<number | null>(null);
+  const onRevertChangesRef = useRef(onRevertChanges);
+  const onReviewChangesRef = useRef(onReviewChanges);
+  const onForkTurnRef = useRef(onForkTurn);
+  const onToggleTraceRef = useRef(onToggleTrace);
+  const taskHUDStateCacheRef = useRef(new Map<string, TaskHUDState>());
+  const turnEventsCacheRef = useRef(new Map<string, StreamEvent[]>());
+  const turnOperationsCacheRef = useRef(new Map<string, { events: StreamEvent[]; operations: HUDOperation[] }>());
+  const historicalTraceToggleRef = useRef(new Map<string, () => void>());
+  onRevertChangesRef.current = onRevertChanges;
+  onReviewChangesRef.current = onReviewChanges;
+  onForkTurnRef.current = onForkTurn;
+  onToggleTraceRef.current = onToggleTrace;
+  const stableRevertChanges = useCallback(() => onRevertChangesRef.current(), []);
+  const stableReviewChanges = useCallback((turnId?: string, path?: string) => onReviewChangesRef.current(turnId, path), []);
+  const stableForkTurn = useCallback((turnId: string) => onForkTurnRef.current(turnId), []);
 
   useEffect(() => {
     if (!expandedAttachment) return undefined;
@@ -449,6 +599,10 @@ export function AgentWorkspace({
 
   useEffect(() => {
     setTraceExpandedByTurn({});
+    taskHUDStateCacheRef.current.clear();
+    turnEventsCacheRef.current.clear();
+    turnOperationsCacheRef.current.clear();
+    historicalTraceToggleRef.current.clear();
   }, [activeSessionId]);
 
   useEffect(() => {
@@ -529,6 +683,7 @@ export function AgentWorkspace({
     window.requestAnimationFrame(() => composerRef.current?.focus());
   }, [onEditSteer]);
 
+  const messageGroupCacheRef = useRef<ConversationMessageGroup[]>([]);
   const messageGroups = useMemo<ConversationMessageGroup[]>(() => {
     const groups: ConversationMessageGroup[] = [];
     const groupsByTurn = new Map<string, ConversationMessageGroup>();
@@ -546,8 +701,109 @@ export function AgentWorkspace({
       groupsByTurn.set(message.turnId, group);
       groups.push(group);
     }
-    return groups;
+    const previousByKey = new Map(messageGroupCacheRef.current.map((group) => [group.key, group]));
+    const stableGroups = groups.map((group) => {
+      const previous = previousByKey.get(group.key);
+      if (
+        previous
+        && previous.turnId === group.turnId
+        && previous.messages.length === group.messages.length
+        && previous.messages.every((message, index) => message === group.messages[index])
+      ) {
+        return previous;
+      }
+      return group;
+    });
+    messageGroupCacheRef.current = stableGroups;
+    return stableGroups;
   }, [messages]);
+
+  const virtualizer = useVirtualizer({
+    count: messageGroups.length,
+    getScrollElement: () => messagesRef.current,
+    estimateSize: () => 180,
+    getItemKey: (index) => messageGroups[index]?.key ?? index,
+    overscan: 6,
+  });
+
+  const getStableTaskHUDState = useCallback((turnId: string | null): TaskHUDState | undefined => {
+    if (!turnId) return undefined;
+    const next = taskHUDByTurn[turnId];
+    if (!next) {
+      taskHUDStateCacheRef.current.delete(turnId);
+      return undefined;
+    }
+    const previous = taskHUDStateCacheRef.current.get(turnId);
+    if (previous && sameTaskHUDState(previous, next)) return previous;
+    taskHUDStateCacheRef.current.set(turnId, next);
+    return next;
+  }, [taskHUDByTurn]);
+
+  const turnEventsByTurn = useMemo(() => {
+    const nextEvents = new Map<string, StreamEvent[]>();
+    for (const event of conversationEvents) {
+      if (!event.turnId) continue;
+      const eventsForTurn = nextEvents.get(event.turnId) ?? [];
+      eventsForTurn.push(event);
+      nextEvents.set(event.turnId, eventsForTurn);
+    }
+    const stableEvents = new Map<string, StreamEvent[]>();
+    for (const [turnId, eventsForTurn] of nextEvents) {
+      const previous = turnEventsCacheRef.current.get(turnId);
+      const stable = previous
+        && previous.length === eventsForTurn.length
+        && previous.every((event, index) => event === eventsForTurn[index])
+        ? previous
+        : eventsForTurn;
+      stableEvents.set(turnId, stable);
+    }
+    turnEventsCacheRef.current = stableEvents;
+    return stableEvents;
+  }, [conversationEvents]);
+
+  const traceOnlyAssistantIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const event of conversationEvents) {
+      if (event.type !== "assistant.message") continue;
+      const phase = String(event.payload.phase ?? "final");
+      if (phase !== "planning" && phase !== "finding" && event.payload.stream_retracted !== true) continue;
+      const streamId = String(event.payload.stream_id ?? "").trim();
+      ids.add(streamId || event.event_id);
+    }
+    return ids;
+  }, [conversationEvents]);
+
+  const traceOnlyAssistantTexts = useMemo(() => {
+    const texts = new Set<string>();
+    for (const event of conversationEvents) {
+      if (event.type !== "assistant.message") continue;
+      const phase = String(event.payload.phase ?? "final");
+      if (phase !== "planning" && phase !== "finding") continue;
+      const text = String(event.payload.text ?? "").trim();
+      if (text) texts.add(`${event.turnId ?? ""}:${text}`);
+    }
+    return texts;
+  }, [conversationEvents]);
+
+  const getStableTurnOperations = useCallback((turnId: string, turnEvents: StreamEvent[]): HUDOperation[] => {
+    const previous = turnOperationsCacheRef.current.get(turnId);
+    if (previous?.events === turnEvents) return previous.operations;
+    const operations = deriveTaskHUD(turnEvents, [], false).operations;
+    turnOperationsCacheRef.current.set(turnId, { events: turnEvents, operations });
+    return operations;
+  }, []);
+
+  const getHistoricalTraceToggle = useCallback((turnId: string): (() => void) => {
+    const existing = historicalTraceToggleRef.current.get(turnId);
+    if (existing) return existing;
+    const toggle = () => setTraceExpandedByTurn((current) => ({
+      ...current,
+      [turnId]: !(current[turnId] ?? false),
+    }));
+    historicalTraceToggleRef.current.set(turnId, toggle);
+    return toggle;
+  }, []);
+  const stableToggleTrace = useCallback(() => onToggleTraceRef.current(), []);
 
   const navigableTurns = useMemo(
     () => messageGroups.filter((group): group is ConversationMessageGroup & { turnId: string } => Boolean(group.turnId)),
@@ -555,12 +811,13 @@ export function AgentWorkspace({
   );
 
   const scrollToTurn = useCallback((turnId: string) => {
-    const element = turnRefs.current.get(turnId);
-    if (!element) {
+    const index = messageGroups.findIndex((group) => group.turnId === turnId);
+    if (index < 0) {
       return;
     }
     setFocusedTurnId(turnId);
     setHighlightedTurnId(null);
+    virtualizer.scrollToIndex(index, { align: "start", behavior: "smooth" });
     window.requestAnimationFrame(() => setHighlightedTurnId(turnId));
     if (highlightTimerRef.current !== null) {
       window.clearTimeout(highlightTimerRef.current);
@@ -569,10 +826,10 @@ export function AgentWorkspace({
       setHighlightedTurnId(null);
       highlightTimerRef.current = null;
     }, 900);
-    element.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, []);
+  }, [messageGroups, virtualizer]);
 
   const composerHUDEnabled = Boolean(activeSessionId) && Boolean(activeTurnId);
+  const canCancelTurn = Boolean(activeTurnId);
 
   const toggleVoice = useCallback(async () => {
     if (isListening) { voiceRecorderRef.current?.recorder.stop(); return; }
@@ -690,27 +947,26 @@ export function AgentWorkspace({
           aria-live="polite"
           onScroll={updateScrollToBottomVisibility}
         >
-          {hasOlderHistory && (
-            <button
-              className="history-load-button"
-              type="button"
-              onClick={onLoadOlderHistory}
-              disabled={loadingOlderHistory}
-            >
-              {loadingOlderHistory ? "正在加载更早历史..." : "加载更早历史"}
-            </button>
-          )}
           {messages.length === 0 && <div className="empty-state"><img src={logoUrl} alt="Buffeed" /><p>我们来创造些什么？</p></div>}
-          {messageGroups.map((group) => {
+          <div
+            className="virtual-message-list"
+            style={{ height: `${virtualizer.getTotalSize()}px` }}
+          >
+          {virtualizer.getVirtualItems().map((virtualItem) => {
+          const group = messageGroups[virtualItem.index];
+          if (!group) return null;
           const isLatestTurn = group.turnId !== null && group.turnId === latestConversationTurnId;
           const turnEvents = isLatestTurn
             ? latestConversationEvents
             : group.turnId
-              ? conversationEvents.filter((event) => event.turnId === group.turnId)
-              : [];
+              ? turnEventsByTurn.get(group.turnId) ?? EMPTY_EVENTS
+              : EMPTY_EVENTS;
+          const turnIsTerminal = terminalPhase(turnEvents) !== null;
           const turnOperations = isLatestTurn
             ? taskHUD.operations
-              : deriveTaskHUD(turnEvents, [], false).operations;
+              : group.turnId
+                ? getStableTurnOperations(group.turnId, turnEvents)
+                : [];
           const turnTimestamp = [...turnEvents].reverse().find((event) => event.createdAt !== null)?.createdAt ?? null;
           const traceExpandedForTurn = group.turnId
             ? isLatestTurn
@@ -719,27 +975,34 @@ export function AgentWorkspace({
             : false;
           const toggleTraceForTurn = group.turnId
             ? isLatestTurn
-              ? onToggleTrace
-              : () => setTraceExpandedByTurn((current) => ({
-                ...current,
-                [group.turnId as string]: !(current[group.turnId as string] ?? false),
-              }))
-            : () => undefined;
-          const assistantMessages = group.messages.filter((message) => message.role !== "user");
+              ? stableToggleTrace
+              : getHistoricalTraceToggle(group.turnId)
+            : NOOP;
+          const assistantMessages = group.messages.filter((message) => (
+            message.role !== "user"
+            && !traceOnlyAssistantIds.has(message.id)
+            && !traceOnlyAssistantTexts.has(`${message.turnId ?? ""}:${message.text.trim()}`)
+          ));
+          const streamingPreviews = assistantMessages
+            .filter((message) => streamingMessageIds.has(message.id))
+            .map((message) => ({
+              id: message.id,
+              text: message.text,
+              order: streamingPreviewOrders[message.id] ?? Number.POSITIVE_INFINITY,
+            }));
+          const completedAssistantMessages = assistantMessages.filter((message) => !streamingMessageIds.has(message.id));
           return (
             <div
-              className="message-group"
-              key={group.key}
-              ref={(element) => {
-                if (!group.turnId) {
-                  return;
-                }
-                if (element) {
-                  turnRefs.current.set(group.turnId, element);
-                } else {
-                  turnRefs.current.delete(group.turnId);
-                }
+              className="virtual-message-row"
+              key={virtualItem.key}
+              data-index={virtualItem.index}
+              ref={virtualizer.measureElement}
+              style={{
+                transform: `translateY(${virtualItem.start}px)`,
               }}
+            >
+            <div
+              className="message-group"
             >
               {group.messages.filter((message) => message.role === "user").map((message) => (
                 <UserMessage
@@ -750,10 +1013,11 @@ export function AgentWorkspace({
                   onPreviewAttachment={openMediaPreview}
                 />
               ))}
-              {group.turnId && turnEvents.length > 0 && (
+              {group.turnId && (turnEvents.length > 0 || streamingPreviews.length > 0) && (
                 <ExecutionTrace
                   events={turnEvents}
                   operations={turnOperations}
+                  streamingPreviews={streamingPreviews}
                   baseUrl={agentApi}
                   sessionId={activeSessionId}
                   expanded={traceExpandedForTurn}
@@ -762,44 +1026,32 @@ export function AgentWorkspace({
                   onToggle={toggleTraceForTurn}
                 />
               )}
-              {assistantMessages.map((message, assistantIndex) => (
-                <article className={`message ${message.role} ${isLatestTurn ? "latest-turn" : ""}`} key={message.id}>
-                  <div className="message-content">
-                    <MarkdownContent text={message.text} />
-                  </div>
-                  {group.turnId && group.turnId !== activeTurnId && assistantIndex === assistantMessages.length - 1 && taskHUDByTurn[group.turnId]?.summary && (
-                    <div className="message-summary-hud">
-                      <TaskHUD
-                        state={taskHUDByTurn[group.turnId]}
-                        variant="summary"
-                        enabled
-                        onRevert={onRevertChanges}
-                        onReview={(path) => onReviewChanges(group.turnId ?? undefined, path)}
-                      />
-                    </div>
-                  )}
-                  {(!group.turnId || group.turnId !== activeTurnId) && (
-                    <div className="message-copy-row message-copy-row-assistant assistant-action-row">
-                      <CopyButton text={message.text} label="复制回复" className="message-copy-button" />
-                      {group.turnId && (
-                        <button
-                          className="message-copy-button fork-button"
-                          type="button"
-                          title="Fork 当前回合"
-                          aria-label="Fork 当前回合"
-                          onClick={() => void onForkTurn(group.turnId as string)}
-                        >
-                          <GitFork size={14} />
-                        </button>
-                      )}
-                      {turnTimestamp !== null && <time className="message-turn-time">{turnTimeLabel(turnTimestamp)}</time>}
-                    </div>
-                  )}
-                </article>
-              ))}
+              {completedAssistantMessages.map((message, assistantIndex) => {
+                const isActiveTurn = group.turnId !== null && group.turnId === activeTurnId;
+                const taskHUDState = getStableTaskHUDState(group.turnId);
+                const isLastAssistantMessage = assistantIndex === completedAssistantMessages.length - 1;
+                return (
+                  <AssistantMessage
+                    key={message.id}
+                    message={message}
+                    isLatestTurn={isLatestTurn}
+                    isStreaming={false}
+                    showTaskHUD={Boolean(group.turnId && !isActiveTurn && assistantIndex === completedAssistantMessages.length - 1)}
+                    showActions={turnIsTerminal && isLastAssistantMessage}
+                    turnId={group.turnId}
+                    turnTimestamp={turnTimestamp}
+                    taskHUDState={taskHUDState}
+                    onRevertChanges={stableRevertChanges}
+                    onReviewChanges={stableReviewChanges}
+                    onForkTurn={stableForkTurn}
+                  />
+                );
+              })}
+            </div>
             </div>
           );
           })}
+          </div>
           {(activeTurnId || turnSubmitting) && (
             <div className="processing-line" role="status" aria-live="polite">
               <span className="thinking-text">正在思考...</span>
@@ -1004,13 +1256,13 @@ export function AgentWorkspace({
               </div> : null}
             </div> : null}
             <button
-              className={`primary-button send-button ${activeTurnId ? "is-stop" : ""}`}
-              title={activeTurnId ? "停止当前回合" : "发送任务"}
-              aria-label={activeTurnId ? "停止当前回合" : "发送任务"}
-              onClick={() => void (activeTurnId ? onCancelTurn() : onSendTurn())}
-              disabled={activeTurnId ? false : (!prompt.trim() && attachments.length === 0) || !activeSessionId || turnSubmitting || Boolean(pendingSteerText)}
+              className={`primary-button send-button ${canCancelTurn ? "is-stop" : ""}`}
+              title={canCancelTurn ? "停止当前回合" : "发送任务"}
+              aria-label={canCancelTurn ? "停止当前回合" : "发送任务"}
+              onClick={() => void (canCancelTurn ? onCancelTurn() : onSendTurn())}
+              disabled={canCancelTurn ? false : (!prompt.trim() && attachments.length === 0) || !activeSessionId || turnSubmitting || Boolean(pendingSteerText)}
             >
-              {activeTurnId ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} strokeWidth={2.5} />}
+              {canCancelTurn ? <Square size={14} fill="currentColor" /> : <ArrowUp size={18} strokeWidth={2.5} />}
             </button>
           </div>
         </div>

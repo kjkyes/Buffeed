@@ -27,6 +27,12 @@ export type KnownAgentStreamEventType = (typeof AGENT_STREAM_EVENT_TYPES)[number
 // The journal remains forward-compatible with event types added by the runtime.
 export type AgentStreamEventType = string;
 export type EventPayload = Record<string, unknown>;
+export type StreamEventPayload = EventPayload & {
+  stream_id?: string;
+  stream_seq?: number;
+  durability?: "volatile" | "durable";
+  stream_recovered?: boolean;
+};
 
 export type Session = {
   session_id: string;
@@ -43,14 +49,14 @@ export type StreamEvent = {
   event_id: string;
   type: string;
   turnId: string | null;
-  payload: EventPayload;
+  payload: StreamEventPayload;
   createdAt: number | null;
 };
 
 /** JSON body carried by one SSE frame; id and event type live in SSE headers. */
 export type SseEventData = {
   turn_id: string | null;
-  payload: EventPayload;
+  payload: StreamEventPayload;
   created_at?: number;
 };
 
@@ -64,7 +70,7 @@ export type PersistedStreamEvent = {
   event_id: number;
   event_type: string;
   turn_id: string | null;
-  payload: EventPayload;
+  payload: StreamEventPayload;
   created_at: number;
 };
 
@@ -82,6 +88,7 @@ export type ChatMessage = {
   text: string;
   turnId: string | null;
   attachments?: ChatAttachment[];
+  recovered?: boolean;
 };
 
 export type Approval = {

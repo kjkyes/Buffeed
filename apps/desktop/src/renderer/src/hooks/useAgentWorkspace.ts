@@ -10,6 +10,7 @@ import {
   type StreamEvent,
 } from "../domains/agent";
 import { useAgentEventStream } from "../services/agentEvents";
+import { ApiError } from "../services/http";
 import { useTaskHUD } from "./useTaskHUD";
 import {
   cancelTurnRequest,
@@ -58,6 +59,13 @@ type ClientTurnPerformance = {
   reported: boolean;
 };
 
+type StreamBuffer = {
+  turnId: string | null;
+  text: string;
+  frame: number | null;
+  lastEventOrder: number;
+};
+
 const NEW_CONVERSATION_DRAFT_KEY = "__new_conversation__";
 const MAX_PERSISTED_ATTACHMENT_PREVIEW_URL_CHARS = 750_000;
 
@@ -67,11 +75,34 @@ function errorMessage(error: unknown): string {
 
 function eventOrder(event: StreamEvent): number {
   const numeric = Number(event.event_id);
-  const createdAt = event.createdAt ?? Number.POSITIVE_INFINITY;
-  return createdAt * 1_000_000 + (Number.isFinite(numeric) ? numeric : 0);
+  const streamSeq = Number(event.payload.stream_seq);
+  const tieBreaker = Number.isFinite(numeric) ? numeric : Number.isFinite(streamSeq) ? streamSeq : 0;
+  if (typeof event.createdAt === "number" && Number.isFinite(event.createdAt)) {
+    return event.createdAt * 1_000_000 + tieBreaker;
+  }
+  return Number.MAX_SAFE_INTEGER - 1_000_000 + Math.min(Math.max(tieBreaker, 0), 999_999);
+}
+
+function eventIdentity(event: StreamEvent): string {
+  const streamId = String(event.payload.stream_id ?? "").trim();
+  const streamSeq = Number(event.payload.stream_seq);
+  return streamId && Number.isFinite(streamSeq)
+    ? `stream:${streamId}:${streamSeq}`
+    : `event:${event.event_id}`;
+}
+
+function isStreamingAssistantEvent(event: StreamEvent): boolean {
+  return event.type === "assistant.message"
+    && String(event.payload.phase ?? "final") === "streaming";
+}
+
+function isTraceOnlyAssistantPhase(phase: string): boolean {
+  return phase === "planning" || phase === "finding";
 }
 
 const FOLDED_LIFECYCLE_EVENTS = new Set(["model.requested", "turn.completed"]);
+const TERMINAL_TURN_STATUSES = new Set(["completed", "cancelled", "error"]);
+const ACTIVE_TURN_STATUS_RECONCILE_INTERVAL_MS = 3_000;
 // Runtime restoration and first-use model setup can exceed the normal request latency.
 const TURN_SUBMIT_TIMEOUT_MS = 20_000;
 const ATTACHMENT_CONTEXT_MARKER = "[附件上下文]";
@@ -119,6 +150,8 @@ export function useAgentWorkspace({
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [streamingMessageIds, setStreamingMessageIds] = useState<Set<string>>(() => new Set());
+  const [streamingPreviewOrders, setStreamingPreviewOrders] = useState<Record<string, number>>({});
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [prompt, setPrompt] = useState("");
@@ -149,6 +182,12 @@ export function useAgentWorkspace({
     attachments: ChatAttachment[];
   } | null>(null);
   const clientTurnPerformanceRef = useRef<Record<string, ClientTurnPerformance>>({});
+  const streamBuffersRef = useRef(new Map<string, StreamBuffer>());
+  const streamingMessageIdsRef = useRef(new Set<string>());
+  // A trace stream can still have queued SSE fragments after its retraction
+  // event. Keep the decision outside React state so late fragments cannot
+  // recreate a planning/finding message below the final answer.
+  const traceOnlyStreamIdsRef = useRef(new Set<string>());
   const activeTurnRef = useRef<string | null>(activeTurnId);
   activeTurnRef.current = activeTurnId;
 
@@ -333,18 +372,157 @@ export function useAgentWorkspace({
     });
   }, [agentApi]);
 
-  const consumeEvent = useCallback((streamEvent: StreamEvent) => {
-    if (FOLDED_LIFECYCLE_EVENTS.has(streamEvent.type)) return;
-    setEvents((current) => {
-      if (current.some((item) => item.event_id === streamEvent.event_id)) {
-        return current;
-      }
-      const next = [...current, streamEvent].sort(
-        (left, right) => eventOrder(left) - eventOrder(right),
-      );
+  const markStreamActive = useCallback((streamId: string, active: boolean) => {
+    const ids = streamingMessageIdsRef.current;
+    if (active) {
+      if (ids.has(streamId)) return;
+      ids.add(streamId);
+      setStreamingMessageIds((current) => {
+        if (current.has(streamId)) return current;
+        const next = new Set(current);
+        next.add(streamId);
+        return next;
+      });
+      return;
+    }
+    if (!ids.delete(streamId)) return;
+    setStreamingMessageIds((current) => {
+      if (!current.has(streamId)) return current;
+      const next = new Set(current);
+      next.delete(streamId);
       return next;
     });
+  }, []);
+
+  const flushStreamBuffer = useCallback((streamId: string) => {
+    const buffer = streamBuffersRef.current.get(streamId);
+    if (!buffer || !buffer.text) return;
+    const text = buffer.text;
+    buffer.text = "";
+    const previewOrder = buffer.lastEventOrder;
+    setStreamingPreviewOrders((current) => (
+      current[streamId] === previewOrder
+        ? current
+        : { ...current, [streamId]: previewOrder }
+    ));
+    setMessages((current) => {
+      const existingIndex = current.findIndex(
+        (message) => message.id === streamId && message.role === "assistant",
+      );
+      if (existingIndex < 0) {
+        return [
+          ...current,
+          {
+            id: streamId,
+            role: "assistant",
+            text,
+            turnId: buffer.turnId,
+          } satisfies ChatMessage,
+        ];
+      }
+      return current.map((message, index) => (
+        index === existingIndex
+          ? { ...message, text: `${message.text}${text}` }
+          : message
+      ));
+    });
+  }, []);
+
+  const scheduleStreamFlush = useCallback((streamId: string) => {
+    const buffer = streamBuffersRef.current.get(streamId);
+    if (!buffer || buffer.frame !== null) return;
+    buffer.frame = window.requestAnimationFrame(() => {
+      buffer.frame = null;
+      flushStreamBuffer(streamId);
+    });
+  }, [flushStreamBuffer]);
+
+  const clearStreamingPreviewOrder = useCallback((streamId: string) => {
+    setStreamingPreviewOrders((current) => {
+      if (!(streamId in current)) return current;
+      const next = { ...current };
+      delete next[streamId];
+      return next;
+    });
+  }, []);
+
+  const discardStreamBuffer = useCallback((streamId: string) => {
+    const buffer = streamBuffersRef.current.get(streamId);
+    if (buffer?.frame !== null && buffer?.frame !== undefined) {
+      window.cancelAnimationFrame(buffer.frame);
+    }
+    streamBuffersRef.current.delete(streamId);
+    clearStreamingPreviewOrder(streamId);
+    markStreamActive(streamId, false);
+  }, [clearStreamingPreviewOrder, markStreamActive]);
+
+  const clearStreamBuffers = useCallback(() => {
+    for (const [streamId, buffer] of streamBuffersRef.current) {
+      if (buffer.frame !== null) window.cancelAnimationFrame(buffer.frame);
+      markStreamActive(streamId, false);
+    }
+    streamBuffersRef.current.clear();
+    traceOnlyStreamIdsRef.current.clear();
+    setStreamingPreviewOrders({});
+    streamingMessageIdsRef.current.clear();
+    setStreamingMessageIds((current) => current.size === 0 ? current : new Set());
+  }, [markStreamActive]);
+
+  const flushTurnStreamBuffers = useCallback((turnId: string | null) => {
+    if (!turnId) return;
+    for (const [streamId, buffer] of streamBuffersRef.current) {
+      if (buffer.turnId !== turnId) continue;
+      if (buffer.frame !== null) window.cancelAnimationFrame(buffer.frame);
+      buffer.frame = null;
+      flushStreamBuffer(streamId);
+      streamBuffersRef.current.delete(streamId);
+      clearStreamingPreviewOrder(streamId);
+      markStreamActive(streamId, false);
+    }
+  }, [clearStreamingPreviewOrder, flushStreamBuffer, markStreamActive]);
+
+  const settleActiveTurn = useCallback((turnId: string, finishedAt: number | null) => {
+    if (activeTurnRef.current !== turnId) return;
+    setApprovals((current) => current.filter((approval) => approval.turnId !== turnId));
+    activeTurnRef.current = null;
+    setTurnFinishedAt(finishedAt ?? Date.now() / 1000);
+    setActiveTurnId(null);
+    setTurnSubmitting(false);
+    setTraceExpanded(false);
+    flushTurnStreamBuffers(turnId);
+    if (!clientTurnPerformanceRef.current[turnId]?.firstSseDeltaAt) {
+      delete clientTurnPerformanceRef.current[turnId];
+    }
+    void refreshSessions();
+  }, [flushTurnStreamBuffers, refreshSessions]);
+
+  const consumeEvent = useCallback((streamEvent: StreamEvent) => {
+    if (FOLDED_LIFECYCLE_EVENTS.has(streamEvent.type)) return;
+    // Streaming text is rendered from the ref-backed buffer below. Keeping
+    // each delta out of the global journal avoids rerendering trace and HUD
+    // consumers for every provider fragment.
+    if (!isStreamingAssistantEvent(streamEvent)) {
+      setEvents((current) => {
+        const identity = eventIdentity(streamEvent);
+        if (current.some((item) => eventIdentity(item) === identity)) {
+          return current;
+        }
+        const next = [...current, streamEvent].sort(
+          (left, right) => eventOrder(left) - eventOrder(right),
+        );
+        return next;
+      });
+    }
     onTeamEvent?.(streamEvent);
+    const isTerminalEvent = ["turn.finished", "turn.cancelled", "turn.error"].includes(streamEvent.type);
+    if (streamEvent.turnId && !isTerminalEvent && streamEvent.type !== "turn.queued" && !activeTurnRef.current) {
+      // A restored runtime can miss the original turn.started event. Any later
+      // execution event still identifies the turn that the user can cancel.
+      activeTurnRef.current = streamEvent.turnId;
+      setActiveTurnId(streamEvent.turnId);
+      setTurnStartedAt(streamEvent.createdAt ?? Date.now() / 1000);
+      setTurnFinishedAt(null);
+    }
     if (streamEvent.type === "turn.queued" || streamEvent.type === "turn.started") {
       const isStarted = streamEvent.type === "turn.started";
       const query = String(streamEvent.payload.query ?? "");
@@ -442,35 +620,81 @@ export function useAgentWorkspace({
         measureFirstStreamPaint(streamEvent.turnId);
       }
       if (streamId) {
-        setMessages((current) => {
-          if (streamRetracted) {
-            return current.filter((message) => message.id !== streamId);
+        if (isTraceOnlyAssistantPhase(assistantPhase)) {
+          traceOnlyStreamIdsRef.current.add(streamId);
+        }
+        // Retired trace streams may have fragments already queued in the
+        // browser. Ignore them before touching the buffer or message list.
+        if (assistantPhase === "streaming" && traceOnlyStreamIdsRef.current.has(streamId)) {
+          return;
+        }
+        if (streamRetracted || isTraceOnlyAssistantPhase(assistantPhase)) {
+          discardStreamBuffer(streamId);
+          const traceText = String(streamEvent.payload.text ?? "").trim();
+          setMessages((current) => current.filter((message) => (
+            message.id !== streamId
+            && !(traceText && message.turnId === streamEvent.turnId && message.text.trim() === traceText)
+          )));
+        } else if (assistantPhase === "final" && typeof streamEvent.payload.text === "string" && streamEvent.payload.text) {
+          const buffer = streamBuffersRef.current.get(streamId);
+          if (buffer?.frame !== null && buffer?.frame !== undefined) {
+            window.cancelAnimationFrame(buffer.frame);
           }
-          const existingIndex = current.findIndex(
-            (message) => message.id === streamId && message.role === "assistant",
-          );
-          if (existingIndex < 0) {
-            return streamDelta
-              ? [
-                ...current,
-                {
-                  id: streamId,
-                  role: "assistant",
-                  text: streamDelta,
-                  turnId: streamEvent.turnId,
-                } satisfies ChatMessage,
-              ]
-              : current;
+          streamBuffersRef.current.delete(streamId);
+          clearStreamingPreviewOrder(streamId);
+          markStreamActive(streamId, false);
+          const finalText = streamEvent.payload.text;
+          setMessages((current) => {
+            const existing = current.find((message) => message.id === streamId && message.role === "assistant");
+            if (existing) {
+              return current.map((message) => (
+                message === existing
+                  ? {
+                    ...message,
+                    text: finalText,
+                    recovered: streamEvent.payload.stream_recovered === true || message.recovered,
+                  }
+                  : message
+              ));
+            }
+            return [
+              ...current,
+              {
+                id: streamId,
+                role: "assistant",
+                text: finalText,
+                turnId: streamEvent.turnId,
+                recovered: streamEvent.payload.stream_recovered === true,
+              } satisfies ChatMessage,
+            ];
+          });
+        } else {
+          if (assistantPhase === "streaming" && streamDelta) {
+            const buffer = streamBuffersRef.current.get(streamId) ?? {
+              turnId: streamEvent.turnId,
+              text: "",
+              frame: null,
+              lastEventOrder: eventOrder(streamEvent),
+            } satisfies StreamBuffer;
+            buffer.turnId = streamEvent.turnId;
+            buffer.text += streamDelta;
+            buffer.lastEventOrder = eventOrder(streamEvent);
+            streamBuffersRef.current.set(streamId, buffer);
+            markStreamActive(streamId, true);
+            scheduleStreamFlush(streamId);
           }
-          if (!streamDelta) {
-            return current;
+          if (streamEvent.payload.stream_done === true || assistantPhase !== "streaming") {
+            const buffer = streamBuffersRef.current.get(streamId);
+            if (buffer?.frame !== null && buffer?.frame !== undefined) {
+              window.cancelAnimationFrame(buffer.frame);
+              buffer.frame = null;
+            }
+            flushStreamBuffer(streamId);
+            streamBuffersRef.current.delete(streamId);
+            clearStreamingPreviewOrder(streamId);
+            markStreamActive(streamId, false);
           }
-          return current.map((message, index) => (
-            index === existingIndex
-              ? { ...message, text: `${message.text}${streamDelta}` }
-              : message
-          ));
-        });
+        }
       } else {
         setMessages((current) => [
           ...current,
@@ -501,19 +725,12 @@ export function useAgentWorkspace({
       ["turn.finished", "turn.cancelled", "turn.error"].includes(streamEvent.type)
       && streamEvent.turnId === activeTurnRef.current
     ) {
-      setApprovals((current) => current.filter((approval) => approval.turnId !== streamEvent.turnId));
-      activeTurnRef.current = null;
-      setTurnFinishedAt(streamEvent.createdAt ?? Date.now() / 1000);
-      setActiveTurnId(null);
-      setTurnSubmitting(false);
-      setTraceExpanded(false);
       const completedTurnId = streamEvent.turnId;
-      if (completedTurnId && !clientTurnPerformanceRef.current[completedTurnId]?.firstSseDeltaAt) {
-        delete clientTurnPerformanceRef.current[completedTurnId];
+      if (completedTurnId) {
+        settleActiveTurn(completedTurnId, streamEvent.createdAt);
       }
-      void refreshSessions();
     }
-  }, [activeSessionId, activeTurnId, measureFirstStreamPaint, onTeamEvent, refreshSessions]);
+  }, [activeSessionId, activeTurnId, clearStreamingPreviewOrder, discardStreamBuffer, flushStreamBuffer, markStreamActive, measureFirstStreamPaint, onTeamEvent, scheduleStreamFlush, settleActiveTurn]);
 
   useEffect(() => {
     const currentTurnId = activeTurnRef.current;
@@ -527,14 +744,60 @@ export function useAgentWorkspace({
     if (!terminalEvent) {
       return;
     }
-    setApprovals((current) => current.filter((approval) => approval.turnId !== currentTurnId));
-    activeTurnRef.current = null;
-    setTurnFinishedAt(terminalEvent.createdAt ?? Date.now() / 1000);
-    setActiveTurnId(null);
-    setTurnSubmitting(false);
-    setTraceExpanded(false);
-    void refreshSessions();
-  }, [events, refreshSessions]);
+    settleActiveTurn(currentTurnId, terminalEvent.createdAt);
+  }, [events, settleActiveTurn]);
+
+  useEffect(() => {
+    const sessionId = activeSessionId;
+    const turnId = activeTurnId;
+    if (!sessionId || !turnId) {
+      return undefined;
+    }
+    let cancelled = false;
+    let checking = false;
+
+    const reconcile = async (): Promise<void> => {
+      if (cancelled || checking || activeTurnRef.current !== turnId) return;
+      checking = true;
+      try {
+        const turn = await getTurnStatusRequest(agentApi, sessionId, turnId);
+        if (cancelled || activeTurnRef.current !== turnId || !TERMINAL_TURN_STATUSES.has(turn.status)) {
+          return;
+        }
+        const terminalType = turn.status === "cancelled" ? "turn.cancelled" : turn.status === "error" ? "turn.error" : "turn.finished";
+        const terminalEvent: StreamEvent = {
+          event_id: `reconciled:${turnId}:${turn.finished_at ?? Date.now() / 1000}`,
+          type: terminalType,
+          turnId,
+          payload: {
+            status: turn.status,
+            recovered: true,
+            reconciliation: true,
+          },
+          createdAt: turn.finished_at,
+        };
+        setEvents((current) => {
+          if (current.some((event) => event.turnId === turnId && ["turn.finished", "turn.cancelled", "turn.error"].includes(event.type))) {
+            return current;
+          }
+          return [...current, terminalEvent].sort((left, right) => eventOrder(left) - eventOrder(right));
+        });
+        settleActiveTurn(turnId, turn.finished_at);
+      } catch {
+        // The event stream remains the primary source; a transient status
+        // request failure must not change the visible turn state.
+      } finally {
+        checking = false;
+      }
+    };
+
+    void reconcile();
+    const timer = window.setInterval(() => void reconcile(), ACTIVE_TURN_STATUS_RECONCILE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeSessionId, activeTurnId, agentApi, settleActiveTurn]);
 
   const handleEventStreamError = useCallback((error: unknown) => {
     setStatusMessage(error instanceof Error ? error.message : `事件同步失败：${String(error)}`);
@@ -542,6 +805,7 @@ export function useAgentWorkspace({
 
   useEffect(() => {
     const draft = composerDraftsRef.current[draftKey];
+    clearStreamBuffers();
     setMessages([]);
     setEvents([]);
     setApprovals([]);
@@ -557,12 +821,15 @@ export function useAgentWorkspace({
     clientTurnPerformanceRef.current = {};
     setPrompt(draft?.prompt ?? "");
     setAttachments(draft?.attachments.map((item) => ({ ...item })) ?? []);
-  }, [activeSessionId, draftKey]);
+  }, [activeSessionId, clearStreamBuffers, draftKey]);
 
-  const { hasOlderHistory, loadingOlderHistory, loadOlderHistory } = useAgentEventStream({
+  useEffect(() => () => {
+    clearStreamBuffers();
+  }, [clearStreamBuffers]);
+
+  useAgentEventStream({
     baseUrl: agentApi,
     sessionId: activeSessionId,
-    fullHistory: activeSession?.history_mode === "full",
     onEvent: consumeEvent,
     onError: handleEventStreamError,
   });
@@ -613,15 +880,15 @@ export function useAgentWorkspace({
     setWorkspace(session.workspace);
     // Switch the renderer immediately; history replay and runtime warming are independent.
     setActiveSessionId(session.session_id);
-    setStatusMessage(
-      session.history_mode === "full"
-        ? "正在加载热点会话完整历史，Agent 会话将在后台恢复"
-        : "正在加载近期历史，Agent 会话将在后台恢复",
-    );
+    setStatusMessage("正在加载会话完整历史，Agent 会话将在后台恢复");
     try {
       const details = await getSession(agentApi, session.session_id);
       if (sessionSelectionRef.current !== selectionId) {
         return;
+      }
+      if (details.active_turn_id) {
+        activeTurnRef.current = details.active_turn_id;
+        setActiveTurnId(details.active_turn_id);
       }
       setStatusMessage(
         details.runtime_status === "restoring"
@@ -869,14 +1136,44 @@ export function useAgentWorkspace({
     setStatusMessage("已取消追加消息");
   };
 
+  const settleInactiveTurn = useCallback(async (sessionId: string, turnId: string) => {
+    try {
+      const [turn, session] = await Promise.all([
+        getTurnStatusRequest(agentApi, sessionId, turnId),
+        getSession(agentApi, sessionId),
+      ]);
+      if (activeSessionId !== sessionId) return;
+      if (["running", "queued"].includes(turn.status)) {
+        setStatusMessage("回合状态正在同步，请稍后重试停止");
+        return;
+      }
+      activeTurnRef.current = null;
+      setActiveTurnId(null);
+      setTurnSubmitting(false);
+      setTurnFinishedAt(turn.finished_at ?? Date.now() / 1000);
+      setApprovals((current) => current.filter((approval) => approval.turnId !== turnId));
+      setTraceExpanded(false);
+      flushTurnStreamBuffers(turnId);
+      void refreshSessions();
+      setStatusMessage("回合已结束，已同步最新状态");
+    } catch (error) {
+      setStatusMessage(`回合状态同步失败：${errorMessage(error)}`);
+    }
+  }, [activeSessionId, agentApi, flushTurnStreamBuffers, refreshSessions]);
+
   const cancelTurn = async () => {
-    if (!activeSessionId || !activeTurnId) {
+    const turnId = activeTurnRef.current ?? activeTurnId ?? latestConversationTurnId;
+    if (!activeSessionId || !turnId) {
       return;
     }
     try {
-      await cancelTurnRequest(agentApi, activeSessionId, activeTurnId);
+      await cancelTurnRequest(agentApi, activeSessionId, turnId);
       setStatusMessage("已请求协作式停止");
     } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        await settleInactiveTurn(activeSessionId, turnId);
+        return;
+      }
       setStatusMessage(errorMessage(error));
     }
   };
@@ -913,6 +1210,8 @@ export function useAgentWorkspace({
     activeSession,
     workspace,
     messages,
+    streamingMessageIds,
+    streamingPreviewOrders,
     approvals,
     prompt,
     attachments,
@@ -933,8 +1232,6 @@ export function useAgentWorkspace({
     latestConversationTurnId,
     latestConversationEvents,
     conversationEvents: events,
-    hasOlderHistory,
-    loadingOlderHistory,
     taskHUD,
     taskHUDByTurn,
     traceExpanded,
@@ -956,6 +1253,5 @@ export function useAgentWorkspace({
     reviewChanges,
     resolveApproval,
     forkTurn,
-    loadOlderHistory,
   };
 }

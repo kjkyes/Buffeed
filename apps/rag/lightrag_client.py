@@ -146,6 +146,12 @@ class GatewaySettings:
     ingest_roots: tuple[Path, ...]
     ingest_mode: IngestPathMode = "auto"
     ingest_container_dir: str = DEFAULT_INGEST_CONTAINER_DIR
+    retrieval_cache_enabled: bool = True
+    retrieval_cache_ttl_seconds: int = 60
+    retrieval_cache_max_entries: int = 256
+    retrieval_cache_max_bytes: int = 8 * 1024 * 1024
+    gateway_prewarm_enabled: bool = True
+    gateway_prewarm_timeout_seconds: int = 10
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
@@ -193,6 +199,20 @@ class GatewaySettings:
                     os.getenv("RAG_INGEST_CONTAINER_DIR", DEFAULT_INGEST_CONTAINER_DIR),
                 ).strip()
                 or DEFAULT_INGEST_CONTAINER_DIR
+            ),
+            retrieval_cache_enabled=_env_bool("RAG_RETRIEVAL_CACHE_ENABLED", True),
+            retrieval_cache_ttl_seconds=_env_int(
+                "RAG_RETRIEVAL_CACHE_TTL_SECONDS", 60, 1, 3600
+            ),
+            retrieval_cache_max_entries=_env_int(
+                "RAG_RETRIEVAL_CACHE_MAX_ENTRIES", 256, 1, 10_000
+            ),
+            retrieval_cache_max_bytes=_env_int(
+                "RAG_RETRIEVAL_CACHE_MAX_BYTES", 8 * 1024 * 1024, 1024, 1_000_000_000
+            ),
+            gateway_prewarm_enabled=_env_bool("RAG_GATEWAY_PREWARM_ENABLED", True),
+            gateway_prewarm_timeout_seconds=_env_int(
+                "RAG_GATEWAY_PREWARM_TIMEOUT_SECONDS", 10, 1, 120
             ),
         )
 

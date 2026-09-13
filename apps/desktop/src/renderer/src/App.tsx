@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AgentWorkspace } from "./components/AgentWorkspace";
 import { AppShell } from "./components/AppShell";
 import { RagManager } from "./components/RagManager";
@@ -7,6 +7,12 @@ import { ToolPanel } from "./components/ToolPanel";
 import { SettingsPage, type AppFont, type AppPalette, type AppTheme, type CodeFont } from "./components/SettingsPage";
 import { PluginsPage, PluginsSidebar, type PluginKind } from "./components/PluginsPage";
 import { useDesktopWorkbench } from "./hooks/useDesktopWorkbench";
+
+function useStableCallback<T extends (...args: any[]) => any>(callback: T): T {
+  const callbackRef = useRef(callback);
+  callbackRef.current = callback;
+  return useCallback(((...args: Parameters<T>) => callbackRef.current(...args)) as T, []);
+}
 
 export default function App() {
   const { statusMessage, agent, team } = useDesktopWorkbench();
@@ -108,6 +114,46 @@ export default function App() {
     setReviewFilePath(null);
   }, [agent.activeSessionId]);
 
+  const handleSettingsBack = useCallback(() => setSettingsOpen(false), []);
+  const handlePluginsBack = useCallback(() => setPluginsOpen(false), []);
+  const handleOpenSettings = useCallback(() => setSettingsOpen(true), []);
+  const handleOpenPlugins = useCallback(() => {
+    setPluginWorkspace(agent.workspace);
+    setPluginsOpen(true);
+  }, [agent.workspace]);
+  const handleToggleTrace = useCallback(() => {
+    agent.setTraceExpanded((expanded) => !expanded);
+  }, [agent.setTraceExpanded]);
+  const handleOpenAttachment = useCallback((path: string) => {
+    setPreviewFilePath(path);
+    setToolPanelVisible(true);
+  }, []);
+  const handleReviewChanges = useCallback((turnId?: string, path?: string) => {
+    setReviewTurnId(turnId ?? agent.activeTurnId);
+    setReviewFilePath(path ?? null);
+    setToolPanelVisible(true);
+  }, [agent.activeTurnId]);
+  const handleToggleToolPanel = useCallback(() => {
+    setToolPanelVisible((visible) => !visible);
+  }, []);
+  const stableStartNewConversation = useStableCallback(agent.startNewConversation);
+  const stableSelectSession = useStableCallback(agent.selectSession);
+  const stableModelChange = useStableCallback(agent.setModel);
+  const stableReasoningEffortChange = useStableCallback(agent.setReasoningEffort);
+  const stableCreateSession = useStableCallback(agent.createSession);
+  const stableAddInputFiles = useStableCallback(agent.addInputFiles);
+  const stableAddClipboardImage = useStableCallback(agent.addClipboardImage);
+  const stableAddSessionHistory = useStableCallback(agent.addSessionHistory);
+  const stableRemoveAttachment = useStableCallback(agent.removeAttachment);
+  const stableSendTurn = useStableCallback(agent.sendTurn);
+  const stableConfirmSteer = useStableCallback(agent.confirmSteer);
+  const stableEditSteer = useStableCallback(agent.editSteer);
+  const stableCancelSteer = useStableCallback(agent.cancelSteer);
+  const stableCancelTurn = useStableCallback(agent.cancelTurn);
+  const stableRevertChanges = useStableCallback(agent.revertChanges);
+  const stableResolveApproval = useStableCallback(agent.resolveApproval);
+  const stableForkTurn = useStableCallback(agent.forkTurn);
+
   if (new URLSearchParams(window.location.search).get("ragManager") === "1") {
     return <RagManager />;
   }
@@ -133,7 +179,7 @@ export default function App() {
         onCodeFontSizeChange={setCodeFontSize}
         onLayoutScaleChange={setLayoutScale}
         onTaskHudGlassChange={setTaskHudGlass}
-        onBack={() => setSettingsOpen(false)}
+        onBack={handleSettingsBack}
       />
     );
   }
@@ -141,8 +187,8 @@ export default function App() {
   if (pluginsOpen) {
     return (
       <AppShell
-        sidebar={<PluginsSidebar kind={pluginKind} onKindChange={setPluginKind} onBack={() => setPluginsOpen(false)} />}
-        agentWorkspace={<PluginsPage agentApi={agent.agentApi} workspace={pluginWorkspace} kind={pluginKind} onKindChange={setPluginKind} onWorkspaceChange={setPluginWorkspace} onBack={() => setPluginsOpen(false)} />}
+        sidebar={<PluginsSidebar kind={pluginKind} onKindChange={setPluginKind} onBack={handlePluginsBack} />}
+        agentWorkspace={<PluginsPage agentApi={agent.agentApi} workspace={pluginWorkspace} kind={pluginKind} onKindChange={setPluginKind} onWorkspaceChange={setPluginWorkspace} onBack={handlePluginsBack} />}
         toolPanel={null}
         toolPanelVisible={false}
       />
@@ -158,10 +204,10 @@ export default function App() {
           activeSessionId={agent.activeSessionId}
           statusMessage={statusMessage}
           onWorkspaceChange={agent.setWorkspace}
-          onNewConversation={agent.startNewConversation}
-          onSelectSession={agent.selectSession}
-          onOpenSettings={() => setSettingsOpen(true)}
-          onOpenPlugins={() => { setPluginWorkspace(agent.workspace); setPluginsOpen(true); }}
+          onNewConversation={stableStartNewConversation}
+          onSelectSession={stableSelectSession}
+          onOpenSettings={handleOpenSettings}
+          onOpenPlugins={handleOpenPlugins}
         />
       )}
       agentWorkspace={(
@@ -173,11 +219,11 @@ export default function App() {
           activeSessionId={agent.activeSessionId}
           approvals={agent.approvals}
           messages={agent.messages}
+          streamingMessageIds={agent.streamingMessageIds}
+          streamingPreviewOrders={agent.streamingPreviewOrders}
           latestConversationTurnId={agent.latestConversationTurnId}
           latestConversationEvents={agent.latestConversationEvents}
           conversationEvents={agent.conversationEvents}
-          hasOlderHistory={agent.hasOlderHistory}
-          loadingOlderHistory={agent.loadingOlderHistory}
           taskHUD={agent.taskHUD}
           taskHUDByTurn={agent.taskHUDByTurn}
           activeTurnId={agent.activeTurnId}
@@ -189,34 +235,29 @@ export default function App() {
           prompt={agent.prompt}
           model={agent.model}
           modelOptions={agent.modelOptions}
-          onModelChange={agent.setModel}
+          onModelChange={stableModelChange}
           reasoningEffort={agent.reasoningEffort}
-          onReasoningEffortChange={agent.setReasoningEffort}
-          onToggleTrace={() => agent.setTraceExpanded((expanded) => !expanded)}
-          onLoadOlderHistory={agent.loadOlderHistory}
+          onReasoningEffortChange={stableReasoningEffortChange}
+          onToggleTrace={handleToggleTrace}
           onPromptChange={agent.setPrompt}
-          onCreateSession={agent.createSession}
+          onCreateSession={stableCreateSession}
           attachments={agent.attachments}
-          onAddInputFiles={agent.addInputFiles}
-          onAddClipboardImage={agent.addClipboardImage}
-          onAddSessionHistory={agent.addSessionHistory}
-          onRemoveAttachment={agent.removeAttachment}
-          onOpenAttachment={(path) => { setPreviewFilePath(path); setToolPanelVisible(true); }}
-          onSendTurn={agent.sendTurn}
-          onConfirmSteer={agent.confirmSteer}
-          onEditSteer={agent.editSteer}
-          onCancelSteer={agent.cancelSteer}
-          onCancelTurn={agent.cancelTurn}
-          onRevertChanges={agent.revertChanges}
-          onReviewChanges={(turnId, path) => {
-            setReviewTurnId(turnId ?? agent.activeTurnId);
-            setReviewFilePath(path ?? null);
-            setToolPanelVisible(true);
-          }}
-          onResolveApproval={agent.resolveApproval}
-          onForkTurn={agent.forkTurn}
+          onAddInputFiles={stableAddInputFiles}
+          onAddClipboardImage={stableAddClipboardImage}
+          onAddSessionHistory={stableAddSessionHistory}
+          onRemoveAttachment={stableRemoveAttachment}
+          onOpenAttachment={handleOpenAttachment}
+          onSendTurn={stableSendTurn}
+          onConfirmSteer={stableConfirmSteer}
+          onEditSteer={stableEditSteer}
+          onCancelSteer={stableCancelSteer}
+          onCancelTurn={stableCancelTurn}
+          onRevertChanges={stableRevertChanges}
+          onReviewChanges={handleReviewChanges}
+          onResolveApproval={stableResolveApproval}
+          onForkTurn={stableForkTurn}
           toolPanelVisible={toolPanelVisible}
-          onToggleToolPanel={() => setToolPanelVisible((visible) => !visible)}
+          onToggleToolPanel={handleToggleToolPanel}
         />
       )}
       toolPanel={<ToolPanel workspace={agent.workspace} teamObservation={team.teamObservation} teamObservationError={team.teamObservationError} previewFilePath={previewFilePath} reviewFiles={(reviewTurnId ? agent.taskHUDByTurn[reviewTurnId]?.fileChanges : agent.taskHUD.fileChanges) ?? []} reviewTurnId={reviewTurnId} reviewFilePath={reviewFilePath} />}

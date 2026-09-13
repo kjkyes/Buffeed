@@ -91,6 +91,7 @@ async def _invoke(request: Request, function, **kwargs: Any) -> dict[str, Any]:
 async def lifespan(_: FastAPI):
     # FastMCP's ASGI app requires its session manager to be active when mounted.
     async with gateway.mcp.session_manager.run():
+        await gateway.prewarm_gateway_resources()
         try:
             yield
         finally:

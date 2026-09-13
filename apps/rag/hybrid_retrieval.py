@@ -419,6 +419,8 @@ class HybridRetriever:
         self._client = client
         self._settings = settings
         self._postgres_store = postgres_store
+        self._query_rewrite_client: httpx.AsyncClient | None = None
+        self._query_rewrite_client_lock = asyncio.Lock()
 
     @classmethod
     def from_env(cls, client: LightRAGClient) -> "HybridRetriever":
@@ -439,6 +441,29 @@ class HybridRetriever:
     async def close(self) -> None:
         if self._postgres_store is not None:
             await self._postgres_store.close()
+        if self._query_rewrite_client is not None:
+            await self._query_rewrite_client.aclose()
+            self._query_rewrite_client = None
+
+    async def _get_query_rewrite_client(self) -> httpx.AsyncClient:
+        if self._query_rewrite_client is not None:
+            return self._query_rewrite_client
+        async with self._query_rewrite_client_lock:
+            if self._query_rewrite_client is None:
+                api_key = self._settings.query_rewrite_api_key
+                if not api_key:
+                    raise LightRAGError("query rewrite API key is not configured")
+                self._query_rewrite_client = httpx.AsyncClient(
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=httpx.Timeout(
+                        self._settings.query_rewrite_timeout_seconds
+                    ),
+                    follow_redirects=False,
+                )
+            return self._query_rewrite_client
 
     async def retrieve(
         self,
@@ -594,30 +619,24 @@ class HybridRetriever:
         if not endpoint.endswith("/chat/completions"):
             endpoint = f"{endpoint}/chat/completions"
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(self._settings.query_rewrite_timeout_seconds)
-            ) as client:
-                response = await client.post(
-                    endpoint,
-                    headers={
-                        "Authorization": f"Bearer {self._settings.query_rewrite_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self._settings.query_rewrite_model,
-                        "temperature": 0,
-                        "max_tokens": 128,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "Rewrite the user query for document retrieval. Return only one concise search query without explanation.",
-                            },
-                            {"role": "user", "content": original_query},
-                        ],
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
+            client = await self._get_query_rewrite_client()
+            response = await client.post(
+                endpoint,
+                json={
+                    "model": self._settings.query_rewrite_model,
+                    "temperature": 0,
+                    "max_tokens": 128,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Rewrite the user query for document retrieval. Return only one concise search query without explanation.",
+                        },
+                        {"role": "user", "content": original_query},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
             rewrite = _extract_chat_content(payload)
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             warnings.append(f"query_rewrite:{exc.__class__.__name__}")

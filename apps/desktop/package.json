@@ -11,6 +11,7 @@
     "package:win": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.14.12",
     "@types/dompurify": "^3.0.5",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",

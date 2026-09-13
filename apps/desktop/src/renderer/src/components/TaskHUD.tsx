@@ -9,7 +9,7 @@ import {
   LoaderCircle,
   RotateCcw,
 } from "lucide-react";
-import { useEffect, useState, type MouseEvent } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
 
 import type { HUDFileChange, TaskHUDState } from "../domains/hud";
 
@@ -74,6 +74,27 @@ export function TaskHUD({ state, variant = "running", enabled, onRevert, onRevie
   const [previewPlacement, setPreviewPlacement] = useState<"above" | "below">("below");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [showAllFiles, setShowAllFiles] = useState(false);
+  const previewHideTimerRef = useRef<number | null>(null);
+  const hoverTargetRef = useRef<"file" | "preview" | null>(null);
+
+  const cancelPreviewHide = () => {
+    if (previewHideTimerRef.current !== null) {
+      window.clearTimeout(previewHideTimerRef.current);
+      previewHideTimerRef.current = null;
+    }
+  };
+
+  const schedulePreviewHide = () => {
+    cancelPreviewHide();
+    previewHideTimerRef.current = window.setTimeout(() => {
+      if (hoverTargetRef.current === null) {
+        setSelectedPath(null);
+      }
+      previewHideTimerRef.current = null;
+    }, 600);
+  };
+
+  useEffect(() => () => cancelPreviewHide(), []);
 
   useEffect(() => {
     setDetailsOpen(state.phase !== "running" && state.phase !== "idle" && Boolean(state.summary));
@@ -102,8 +123,8 @@ export function TaskHUD({ state, variant = "running", enabled, onRevert, onRevie
       const placeAbove = spaceBelow < previewHeight && spaceAbove > spaceBelow;
       setPreviewPlacement(placeAbove ? "above" : "below");
       setPreviewTop(placeAbove
-        ? fileRect.top - regionRect.top - previewHeight - 5
-        : fileRect.bottom - regionRect.top + 5);
+        ? fileRect.top - regionRect.top - previewHeight
+        : fileRect.bottom - regionRect.top);
     }
     setSelectedPath(path);
   };
@@ -140,16 +161,42 @@ export function TaskHUD({ state, variant = "running", enabled, onRevert, onRevie
             </button>
           </div>
         </div>
-        <div className="hud-summary-files-hover-region" onMouseLeave={() => setSelectedPath(null)}>
+        <div className="hud-summary-files-hover-region">
           {selectedFile && (
-            <div className={`hud-diff-preview hud-diff-preview-hover placement-${previewPlacement}`} style={{ top: previewTop ?? 0 }}>
+            <div
+              className={`hud-diff-preview hud-diff-preview-hover placement-${previewPlacement}`}
+              style={{ top: previewTop ?? 0 }}
+              onMouseEnter={() => {
+                hoverTargetRef.current = "preview";
+                cancelPreviewHide();
+              }}
+              onMouseMove={cancelPreviewHide}
+              onMouseLeave={() => {
+                hoverTargetRef.current = null;
+                schedulePreviewHide();
+              }}
+            >
               <div className="hud-diff-preview-heading"><FileCode2 size={13} /><strong>{selectedFile.path}</strong></div>
               <DiffPreview file={selectedFile} />
             </div>
           )}
           <div className={`hud-summary-files ${showAllFiles ? "is-expanded" : ""}`}>
             {visibleFiles.map((file) => (
-              <button className="hud-completion-file" type="button" key={file.path} onMouseEnter={(event) => handleFileHover(event, file.path)} onClick={() => void onReview(file.path)}>
+              <button
+                className="hud-completion-file"
+                type="button"
+                key={file.path}
+                onMouseEnter={(event) => {
+                  hoverTargetRef.current = "file";
+                  cancelPreviewHide();
+                  handleFileHover(event, file.path);
+                }}
+                onMouseLeave={() => {
+                  hoverTargetRef.current = null;
+                  schedulePreviewHide();
+                }}
+                onClick={() => void onReview(file.path)}
+              >
                 <span title={file.path}>{file.path}</span>
                 <small><b className="hud-additions">+{file.additions}</b> <b className="hud-deletions">-{file.deletions}</b></small>
               </button>

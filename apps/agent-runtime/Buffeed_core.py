@@ -87,6 +87,60 @@ DASHSCOPE_BASE_URL = os.getenv(
     "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
 ).rstrip("/")
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "").strip()
+DASHSCOPE_HTTP_MAX_CONNECTIONS = max(
+    1, int(os.getenv("BUFFEED_DASHSCOPE_MAX_CONNECTIONS", "32"))
+)
+DASHSCOPE_HTTP_MAX_KEEPALIVE = max(
+    1,
+    min(
+        DASHSCOPE_HTTP_MAX_CONNECTIONS,
+        int(os.getenv("BUFFEED_DASHSCOPE_MAX_KEEPALIVE", "16")),
+    ),
+)
+
+_dashscope_clients: dict[tuple[str, str], httpx.Client] = {}
+_dashscope_clients_lock = threading.RLock()
+
+
+def _get_dashscope_client(
+    endpoint: str,
+    api_key: str,
+    timeout: httpx.Timeout,
+) -> httpx.Client:
+    """Reuse HTTP connections without sharing credentials across endpoints or keys."""
+    cache_key = (endpoint, api_key)
+    with _dashscope_clients_lock:
+        cached = _dashscope_clients.get(cache_key)
+        if cached is not None:
+            return cached
+        created = httpx.Client(
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            limits=httpx.Limits(
+                max_connections=DASHSCOPE_HTTP_MAX_CONNECTIONS,
+                max_keepalive_connections=DASHSCOPE_HTTP_MAX_KEEPALIVE,
+            ),
+            timeout=timeout,
+            follow_redirects=False,
+        )
+        _dashscope_clients[cache_key] = created
+        return created
+
+
+def _close_dashscope_clients() -> None:
+    with _dashscope_clients_lock:
+        clients = list(_dashscope_clients.values())
+        _dashscope_clients.clear()
+    for dashscope_client in clients:
+        try:
+            dashscope_client.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_dashscope_clients)
 
 WORKSPACE_SKILLS_DIR = WORKDIR / "skills"
 BUNDLED_SKILLS_DIR = RUNTIME_DIR / "skills"
@@ -105,6 +159,12 @@ BASE_DELAY_MS = 500
 CONTEXT_LIMIT = 50000
 KEEP_RECENT_TOOL_RESULTS = 3
 PERSIST_THRESHOLD = 30000
+STREAM_DELTA_BATCH_MAX_CHARS = max(
+    1, int(os.getenv("BUFFEED_STREAM_DELTA_BATCH_MAX_CHARS", "128"))
+)
+STREAM_DELTA_BATCH_MAX_DELAY_SECONDS = max(
+    0.001, float(os.getenv("BUFFEED_STREAM_DELTA_BATCH_MAX_DELAY_MS", "30")) / 1_000
+)
 MEMORY_LLM_SELECTION_ENABLED = os.getenv(
     "BUFFEED_MEMORY_LLM_SELECTION", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -201,6 +261,44 @@ def configured_dashscope_models() -> tuple[str, ...]:
     raw = os.getenv("DASHSCOPE_MODELS", "").strip()
     values = raw.split(",") if raw else ["qwen3.8-max", "qwen3.8-flash"]
     return tuple(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+ANTHROPIC_MODEL_MAX_IN_FLIGHT = max(
+    1, int(os.getenv("BUFFEED_ANTHROPIC_MAX_IN_FLIGHT", "8"))
+)
+DASHSCOPE_MODEL_MAX_IN_FLIGHT = max(
+    1, int(os.getenv("BUFFEED_DASHSCOPE_MAX_IN_FLIGHT", "8"))
+)
+TEAM_MAX_MEMBERS = max(
+    1, int(os.getenv("BUFFEED_TEAM_MAX_MEMBERS", "10"))
+)
+MODEL_SLOT_WAIT_SECONDS = max(
+    1.0, float(os.getenv("BUFFEED_MODEL_SLOT_WAIT_SECONDS", "120"))
+)
+_model_request_semaphores = {
+    "anthropic": threading.BoundedSemaphore(ANTHROPIC_MODEL_MAX_IN_FLIGHT),
+    "dashscope": threading.BoundedSemaphore(DASHSCOPE_MODEL_MAX_IN_FLIGHT),
+}
+
+
+def _model_provider(model: str) -> str:
+    return "dashscope" if model in configured_dashscope_models() else "anthropic"
+
+
+@contextmanager
+def _model_request_slot(model: str):
+    provider = _model_provider(model)
+    semaphore = _model_request_semaphores[provider]
+    acquired = semaphore.acquire(timeout=MODEL_SLOT_WAIT_SECONDS)
+    if not acquired:
+        raise RuntimeError(
+            f"{provider} model concurrency limit reached; waited "
+            f"{MODEL_SLOT_WAIT_SECONDS:.0f}s"
+        )
+    try:
+        yield
+    finally:
+        semaphore.release()
 
 
 def _messages_contain_multimodal_video(messages: list[dict[str, Any]]) -> bool:
@@ -1699,6 +1797,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str,
     with TEAM_STATE_LOCK:
         if name in active_teammates:
             return f"Teammate '{name}' already exists"
+        if len(active_teammates) >= TEAM_MAX_MEMBERS:
+            return (
+                f"Team member limit reached ({TEAM_MAX_MEMBERS}); "
+                "wait for an active teammate to finish"
+            )
         # Reserve the name before building optional tool pools so concurrent
         # spawn requests cannot both create a member with the same identity.
         team_run_ids[name] = run_id
@@ -2083,9 +2186,19 @@ def spawn_teammate_thread(name: str, role: str, prompt: str,
                     run_state["phase"] = "model.requested"
                     run_state["summary"] = "正在等待成员模型返回。"
                     record_check("model.requested", "completed", "已发起成员模型检查。")
-                    response = client.messages.create(
-                        model=MODEL, system=system, messages=messages,
-                        tools=sub_tools, max_tokens=8000)
+                    member_state = RecoveryState(MODEL)
+
+                    def request_member_model():
+                        with _model_request_slot(member_state.current_model):
+                            return client.messages.create(
+                                model=member_state.current_model,
+                                system=system,
+                                messages=messages,
+                                tools=sub_tools,
+                                max_tokens=8000,
+                            )
+
+                    response = with_retry(request_member_model, member_state)
                 except Exception as exc:
                     # Surface model/tool failures to the durable Team observer;
                     # silently completing a failed teammate makes the graph lie.
@@ -2696,9 +2809,14 @@ def spawn_subagent(description: str, allow_rag: bool = False) -> str:
     messages = [{"role": "user", "content": description}]
     for _ in range(30):
         messages[:] = snip_compact(messages, max_messages=50)
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM, messages=messages,
-            tools=agent_tools, max_tokens=8000)
+        with _model_request_slot(MODEL):
+            response = client.messages.create(
+                model=MODEL,
+                system=SUB_SYSTEM,
+                messages=messages,
+                tools=agent_tools,
+                max_tokens=8000,
+            )
         messages.append({"role": "assistant", "content": response.content})
         if not has_tool_use(response.content):
             break
@@ -3009,10 +3127,12 @@ def summarize_history(messages: list) -> str:
     prompt = ("Summarize this coding-agent conversation so work can continue. "
               "Preserve current goal, key findings, changed files, remaining work, "
               "and user constraints.\n\n" + conversation)
-    response = client.messages.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000)
+    with _model_request_slot(MODEL):
+        response = client.messages.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+        )
     return extract_text(response.content) or "(empty summary)"
 
 
@@ -4735,11 +4855,12 @@ class MemoryManager:
             f"Recent conversation:\n{recent}\n\nMemory catalog:\n{catalog}"
         )
         try:
-            response = client.messages.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-            )
+            with _model_request_slot(MODEL):
+                response = client.messages.create(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=200,
+                )
         except Exception:
             return None
         payload = _parse_first_json(_message_text(response.content))
@@ -4827,11 +4948,12 @@ class MemoryManager:
             f"Existing memories:\n{existing}\n\nDialogue:\n{dialogue}"
         )
         try:
-            response = client.messages.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=800,
-            )
+            with _model_request_slot(MODEL):
+                response = client.messages.create(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=800,
+                )
         except Exception:
             return 0
         items = _memory_items_from_payload(_parse_first_json(_message_text(response.content)))
@@ -4866,11 +4988,12 @@ class MemoryManager:
             + _truncate_utf8(catalog, 64 * 1024)
         )
         try:
-            response = client.messages.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=3000,
-            )
+            with _model_request_slot(MODEL):
+                response = client.messages.create(
+                    model=MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=3000,
+                )
         except Exception:
             return []
         items = _memory_items_from_payload(_parse_first_json(_message_text(response.content)))
@@ -5217,32 +5340,33 @@ def call_llm(
             if reasoning_effort
             else {}
         )
-        if text_sink is None:
-            return client.messages.create(
-                model=state.current_model,
-                system=system,
-                messages=messages,
-                tools=tools,
-                max_tokens=max_tokens,
-                **provider_options,
-            )
-        stream_id = str(uuid.uuid4())
-        try:
-            with client.messages.stream(
-                model=state.current_model,
-                system=system,
-                messages=messages,
-                tools=tools,
-                max_tokens=max_tokens,
-                **provider_options,
-            ) as stream:
-                for delta in stream.text_stream:
-                    if delta:
-                        text_sink(stream_id, delta, False)
-                return stream.get_final_message()
-        except Exception:
-            text_sink(stream_id, "", True)
-            raise
+        with _model_request_slot(state.current_model):
+            if text_sink is None:
+                return client.messages.create(
+                    model=state.current_model,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    **provider_options,
+                )
+            stream_id = str(uuid.uuid4())
+            try:
+                with client.messages.stream(
+                    model=state.current_model,
+                    system=system,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=max_tokens,
+                    **provider_options,
+                ) as stream:
+                    for delta in stream.text_stream:
+                        if delta:
+                            text_sink(stream_id, delta, False)
+                    return stream.get_final_message()
+            except Exception:
+                text_sink(stream_id, "", True)
+                raise
 
     response = with_retry(request, state)
     return response, stream_id
@@ -5262,6 +5386,70 @@ def _response_output_tokens(response: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return tokens if tokens >= 0 else None
+
+
+class _StreamDeltaCoalescer:
+    """Coalesce fast provider fragments while keeping the first fragment immediate."""
+
+    def __init__(
+        self,
+        sink: Callable[[str, str, bool], None],
+        *,
+        max_chars: int,
+        max_delay_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._sink = sink
+        self._max_chars = max_chars
+        self._max_delay_seconds = max_delay_seconds
+        self._clock = clock
+        self._stream_key: str | None = None
+        self._buffer: list[str] = []
+        self._buffered_chars = 0
+        self._last_emitted_at: float | None = None
+
+    def emit(self, stream_key: str, delta: str, retracted: bool = False) -> None:
+        if self._stream_key is not None and stream_key != self._stream_key:
+            self.flush()
+            self._reset()
+        self._stream_key = stream_key
+        if retracted:
+            self.flush()
+            self._sink(stream_key, "", True)
+            self._reset()
+            return
+        if not delta:
+            self._sink(stream_key, delta, False)
+            return
+        now = self._clock()
+        if not self._buffer and self._last_emitted_at is None:
+            self._sink(stream_key, delta, False)
+            self._last_emitted_at = now
+            return
+        self._buffer.append(delta)
+        self._buffered_chars += len(delta)
+        if (
+            self._buffered_chars >= self._max_chars
+            or (
+                self._last_emitted_at is not None
+                and now - self._last_emitted_at >= self._max_delay_seconds
+            )
+        ):
+            self.flush()
+
+    def flush(self) -> None:
+        if self._stream_key is None or not self._buffer:
+            return
+        self._sink(self._stream_key, "".join(self._buffer), False)
+        self._buffer.clear()
+        self._buffered_chars = 0
+        self._last_emitted_at = self._clock()
+
+    def _reset(self) -> None:
+        self._stream_key = None
+        self._buffer.clear()
+        self._buffered_chars = 0
+        self._last_emitted_at = None
 
 
 @dataclass
@@ -5433,49 +5621,50 @@ def _dashscope_call(
     payload: dict[str, Any] = {"model": model, "messages": _dashscope_messages(system, messages), "max_tokens": max_tokens, "stream": bool(text_sink)}
     if tools:
         payload["tools"] = _dashscope_tools(tools)
-    headers = {"Authorization": f"Bearer {DASHSCOPE_API_KEY}", "Content-Type": "application/json"}
     timeout = httpx.Timeout(180.0, connect=30.0)
+    dashscope_client = _get_dashscope_client(endpoint, DASHSCOPE_API_KEY, timeout)
     try:
-        if text_sink is None:
-            if is_cancelled and is_cancelled():
-                raise VideoPreparationCancelled()
-            response = httpx.post(endpoint, headers=headers, json=payload, timeout=timeout)
-            if response.status_code >= 400:
-                raise RuntimeError(f"百炼请求失败 HTTP {response.status_code}: {response.text[:2000]}")
-            return _dashscope_response(response.json()), None
-        stream_id = str(uuid.uuid4())
-        text_parts: list[str] = []
-        tool_parts: dict[int, dict[str, str]] = {}
-        usage: dict[str, Any] | None = None
-        with httpx.stream("POST", endpoint, headers=headers, json=payload, timeout=timeout) as response:
-            if response.status_code >= 400:
-                raise RuntimeError(f"百炼请求失败 HTTP {response.status_code}: {response.read().decode('utf-8', 'replace')[:2000]}")
-            for line in response.iter_lines():
+        with _model_request_slot(model):
+            if text_sink is None:
                 if is_cancelled and is_cancelled():
                     raise VideoPreparationCancelled()
-                if not line or not line.startswith("data:"):
-                    continue
-                raw = line[5:].strip()
-                if raw == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(raw)
-                except ValueError:
-                    continue
-                if isinstance(chunk.get("usage"), dict):
-                    usage = chunk["usage"]
-                delta = ((chunk.get("choices") or [{}])[0] or {}).get("delta") or {}
-                delta_text = delta.get("content")
-                if isinstance(delta_text, str) and delta_text:
-                    text_parts.append(delta_text)
-                    text_sink(stream_id, delta_text, False)
-                for call in delta.get("tool_calls") or []:
-                    index = int(call.get("index", 0))
-                    target = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
-                    target["id"] += str(call.get("id") or "")
-                    function = call.get("function") or {}
-                    target["name"] += str(function.get("name") or "")
-                    target["arguments"] += str(function.get("arguments") or "")
+                response = dashscope_client.post(endpoint, json=payload, timeout=timeout)
+                if response.status_code >= 400:
+                    raise RuntimeError(f"百炼请求失败 HTTP {response.status_code}: {response.text[:2000]}")
+                return _dashscope_response(response.json()), None
+            stream_id = str(uuid.uuid4())
+            text_parts: list[str] = []
+            tool_parts: dict[int, dict[str, str]] = {}
+            usage: dict[str, Any] | None = None
+            with dashscope_client.stream("POST", endpoint, json=payload, timeout=timeout) as response:
+                if response.status_code >= 400:
+                    raise RuntimeError(f"百炼请求失败 HTTP {response.status_code}: {response.read().decode('utf-8', 'replace')[:2000]}")
+                for line in response.iter_lines():
+                    if is_cancelled and is_cancelled():
+                        raise VideoPreparationCancelled()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if raw == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(chunk.get("usage"), dict):
+                        usage = chunk["usage"]
+                    delta = ((chunk.get("choices") or [{}])[0] or {}).get("delta") or {}
+                    delta_text = delta.get("content")
+                    if isinstance(delta_text, str) and delta_text:
+                        text_parts.append(delta_text)
+                        text_sink(stream_id, delta_text, False)
+                    for call in delta.get("tool_calls") or []:
+                        index = int(call.get("index", 0))
+                        target = tool_parts.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                        target["id"] += str(call.get("id") or "")
+                        function = call.get("function") or {}
+                        target["name"] += str(function.get("name") or "")
+                        target["arguments"] += str(function.get("arguments") or "")
     except httpx.HTTPError as exc:
         if is_cancelled and is_cancelled():
             raise VideoPreparationCancelled() from exc
@@ -5722,7 +5911,7 @@ def agent_loop(
         context["tool_catalog"] = format_tool_catalog(tools)
         stream_text_by_id: dict[str, str] = {}
 
-        def emit_stream_text(stream_key: str, delta: str, retracted: bool = False) -> None:
+        def emit_stream_event(stream_key: str, delta: str, retracted: bool = False) -> None:
             if delta and not retracted:
                 stream_text_by_id[stream_key] = stream_text_by_id.get(stream_key, "") + delta
             callbacks.emit(
@@ -5735,6 +5924,15 @@ def agent_loop(
                 stream_retracted=retracted,
             )
 
+        stream_delta_coalescer = _StreamDeltaCoalescer(
+            emit_stream_event,
+            max_chars=STREAM_DELTA_BATCH_MAX_CHARS,
+            max_delay_seconds=STREAM_DELTA_BATCH_MAX_DELAY_SECONDS,
+        )
+
+        def emit_stream_text(stream_key: str, delta: str, retracted: bool = False) -> None:
+            stream_delta_coalescer.emit(stream_key, delta, retracted)
+
         def finish_stream(
             stream_key: str | None,
             *,
@@ -5744,6 +5942,7 @@ def agent_loop(
         ) -> None:
             if not stream_key:
                 return
+            stream_delta_coalescer.flush()
             callbacks.emit(
                 "assistant.message",
                 text=text,
@@ -5779,6 +5978,9 @@ def agent_loop(
                     # Performance observation must not alter the model turn.
                     pass
         except Exception as e:
+            # DashScope may fail without sending a stream retraction callback;
+            # flush any coalesced text before recording the terminal error.
+            stream_delta_coalescer.flush()
             if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 messages[:] = reactive_compact(messages, context)
                 state.has_attempted_reactive_compact = True
@@ -5840,7 +6042,7 @@ def agent_loop(
                     stream_id,
                     phase=phase,
                     retracted=has_tools,
-                    text=assistant_text if has_tools else "",
+                    text=assistant_text,
                 )
             else:
                 callbacks.emit("assistant.message", text=assistant_text, phase=phase)

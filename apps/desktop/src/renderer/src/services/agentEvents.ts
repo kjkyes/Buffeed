@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 
 import {
   STREAM_EVENTS,
@@ -11,26 +11,16 @@ import { api } from "./http";
 type AgentEventStreamOptions = {
   baseUrl: string;
   sessionId: string | null;
-  fullHistory?: boolean;
   onEvent: (event: StreamEvent) => void;
   onError?: (error: unknown) => void;
 };
 
-export type AgentEventHistoryControls = {
-  hasOlderHistory: boolean;
-  loadingOlderHistory: boolean;
-  loadOlderHistory: () => void;
-};
-
 type EventHistoryResponse = {
   events: PersistedStreamEvent[];
-  has_more_history?: boolean;
-  oldest_event_id?: number | null;
   latest_event_id?: number | null;
 };
 
-const MAX_SEEN_EVENT_IDS = 2_048;
-const HISTORY_WINDOW_EVENTS = 200;
+const MAX_SEEN_EVENT_KEYS = 4_096;
 
 function fromPersistedEvent(event: PersistedStreamEvent): StreamEvent {
   return {
@@ -45,16 +35,11 @@ function fromPersistedEvent(event: PersistedStreamEvent): StreamEvent {
 export function useAgentEventStream({
   baseUrl,
   sessionId,
-  fullHistory = false,
   onEvent,
   onError,
-}: AgentEventStreamOptions): AgentEventHistoryControls {
+}: AgentEventStreamOptions): void {
   const onEventRef = useRef(onEvent);
   const onErrorRef = useRef(onError);
-  const loadOlderHistoryRef = useRef<() => void>(() => undefined);
-  const [hasOlderHistory, setHasOlderHistory] = useState(false);
-  const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
-  const loadOlderHistory = useCallback(() => loadOlderHistoryRef.current(), []);
 
   useEffect(() => {
     onEventRef.current = onEvent;
@@ -64,29 +49,42 @@ export function useAgentEventStream({
   useEffect(() => {
     let cancelled = false;
     let cursor = 0;
-    let oldestEventId: number | null = null;
-    let hasOlder = false;
     let initialHistoryLoaded = false;
     let polling = false;
-    let loadingOlder = false;
     let source: EventSource | null = null;
     let streamOpened = false;
+    let streamConnected = false;
     let reconnectTimer: number | undefined;
     let pollTimer: number | undefined;
-    const seenEventIds = new Set<string>();
+    const seenEventKeys = new Set<string>();
     const seenEventOrder: string[] = [];
 
     const consume = (event: StreamEvent): void => {
-      if (cancelled || !event.event_id || seenEventIds.has(event.event_id)) {
+      if (cancelled) {
         return;
       }
-      seenEventIds.add(event.event_id);
-      seenEventOrder.push(event.event_id);
-      while (seenEventOrder.length > MAX_SEEN_EVENT_IDS) {
-        const expired = seenEventOrder.shift();
-        if (expired) {
-          seenEventIds.delete(expired);
+      const streamId = String(event.payload.stream_id ?? "").trim();
+      const streamSeq = Number(event.payload.stream_seq);
+      const eventKey = streamId && Number.isFinite(streamSeq)
+        ? `stream:${streamId}:${streamSeq}`
+        : event.event_id
+          ? `event:${event.event_id}`
+          : "";
+      if (eventKey && seenEventKeys.has(eventKey)) {
+        const numericEventId = Number(event.event_id);
+        if (Number.isFinite(numericEventId)) {
+          cursor = Math.max(cursor, numericEventId);
         }
+        return;
+      }
+      if (!eventKey) {
+        return;
+      }
+      seenEventKeys.add(eventKey);
+      seenEventOrder.push(eventKey);
+      while (seenEventOrder.length > MAX_SEEN_EVENT_KEYS) {
+        const removed = seenEventOrder.shift();
+        if (removed) seenEventKeys.delete(removed);
       }
       const numericEventId = Number(event.event_id);
       if (Number.isFinite(numericEventId)) {
@@ -96,9 +94,6 @@ export function useAgentEventStream({
     };
 
     if (!sessionId) {
-      setHasOlderHistory(false);
-      setLoadingOlderHistory(false);
-      loadOlderHistoryRef.current = () => undefined;
       return () => {
         cancelled = true;
       };
@@ -107,8 +102,13 @@ export function useAgentEventStream({
     const handleStreamEvent = (event: MessageEvent<string>): void => {
       try {
         const data = JSON.parse(event.data) as SseEventData;
+        const isVolatile = String(data.payload?.durability ?? "") === "volatile";
+        const streamId = String(data.payload?.stream_id ?? "").trim();
+        const streamSeq = Number(data.payload?.stream_seq);
         consume({
-          event_id: event.lastEventId,
+          event_id: isVolatile && streamId && Number.isFinite(streamSeq)
+            ? `volatile:${streamId}:${streamSeq}`
+            : isVolatile ? "" : event.lastEventId,
           type: event.type,
           turnId: data.turn_id,
           payload: data.payload,
@@ -125,15 +125,30 @@ export function useAgentEventStream({
       }
       source?.close();
       streamOpened = true;
-      source = new EventSource(
+      streamConnected = false;
+      const nextSource = new EventSource(
         `${baseUrl}/api/v1/sessions/${sessionId}/events?after=${cursor}`,
       );
-      STREAM_EVENTS.forEach((eventType) => source?.addEventListener(eventType, handleStreamEvent));
-      source.onerror = () => {
-        source?.close();
+      source = nextSource;
+      STREAM_EVENTS.forEach((eventType) => nextSource.addEventListener(eventType, handleStreamEvent));
+      nextSource.onopen = () => {
+        if (source !== nextSource) return;
+        streamConnected = true;
+        if (pollTimer !== undefined) {
+          window.clearInterval(pollTimer);
+          pollTimer = undefined;
+        }
+      };
+      nextSource.onerror = () => {
+        if (source !== nextSource) return;
+        nextSource.close();
         source = null;
         streamOpened = false;
+        streamConnected = false;
         onErrorRef.current?.(new Error("实时事件流已断开，正在按 cursor 重连"));
+        if (!cancelled && pollTimer === undefined) {
+          pollTimer = window.setInterval(() => void pollEvents(), 750);
+        }
         if (!cancelled && reconnectTimer === undefined) {
           reconnectTimer = window.setTimeout(() => {
             reconnectTimer = undefined;
@@ -145,7 +160,7 @@ export function useAgentEventStream({
 
     const pollEvents = async (): Promise<void> => {
       try {
-        if (polling || cancelled) {
+        if (polling || cancelled || (initialHistoryLoaded && streamConnected)) {
           return;
         }
         polling = true;
@@ -165,11 +180,6 @@ export function useAgentEventStream({
           if (typeof response.latest_event_id === "number") {
             cursor = Math.max(cursor, response.latest_event_id);
           }
-          oldestEventId = typeof response.oldest_event_id === "number"
-            ? response.oldest_event_id
-            : null;
-          hasOlder = false;
-          setHasOlderHistory(hasOlder);
           openStream();
         }
       } catch (error) {
@@ -181,39 +191,6 @@ export function useAgentEventStream({
       }
     };
 
-    const loadOlder = async (): Promise<void> => {
-      if (cancelled || loadingOlder || !initialHistoryLoaded || !hasOlder || oldestEventId === null) {
-        return;
-      }
-      loadingOlder = true;
-      setLoadingOlderHistory(true);
-      try {
-        const response = await api<EventHistoryResponse>(
-          baseUrl,
-          `/api/v1/sessions/${sessionId}/events?stream=false&summary=true&before=${oldestEventId}&limit=${HISTORY_WINDOW_EVENTS}`,
-        );
-        if (cancelled) {
-          return;
-        }
-        response.events.forEach((event) => consume(fromPersistedEvent(event)));
-        if (typeof response.oldest_event_id === "number") {
-          oldestEventId = response.oldest_event_id;
-        }
-        hasOlder = response.has_more_history === true;
-        setHasOlderHistory(hasOlder);
-      } catch (error) {
-        if (!cancelled) {
-          onErrorRef.current?.(error);
-        }
-      } finally {
-        loadingOlder = false;
-        if (!cancelled) {
-          setLoadingOlderHistory(false);
-        }
-      }
-    };
-    loadOlderHistoryRef.current = () => void loadOlder();
-
     const start = async (): Promise<void> => {
       // Load the complete folded history before opening the live stream so the
       // conversation is complete and ordered when the session first appears.
@@ -221,7 +198,9 @@ export function useAgentEventStream({
       if (cancelled) {
         return;
       }
-      pollTimer = window.setInterval(() => void pollEvents(), 750);
+      if (pollTimer === undefined && !streamConnected) {
+        pollTimer = window.setInterval(() => void pollEvents(), 750);
+      }
     };
     void start();
 
@@ -230,7 +209,7 @@ export function useAgentEventStream({
       source?.close();
       source = null;
       streamOpened = false;
-      loadOlderHistoryRef.current = () => undefined;
+      streamConnected = false;
       if (reconnectTimer !== undefined) {
         window.clearTimeout(reconnectTimer);
       }
@@ -238,7 +217,5 @@ export function useAgentEventStream({
         window.clearInterval(pollTimer);
       }
     };
-  }, [baseUrl, sessionId, fullHistory]);
-
-  return { hasOlderHistory, loadingOlderHistory, loadOlderHistory };
+  }, [baseUrl, sessionId]);
 }

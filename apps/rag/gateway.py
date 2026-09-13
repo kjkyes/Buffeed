@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import functools
+import hashlib
 import inspect
 import json
 import os
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from uuid import UUID
 
 import rag_config  # noqa: F401 - load the active profile before LightRAG imports
@@ -43,6 +47,165 @@ logger = configure_logging("rag_gateway")
 settings = GatewaySettings.from_env()
 query_slots = asyncio.Semaphore(settings.query_concurrency)
 write_lock = asyncio.Lock()
+
+
+@dataclass
+class _RetrievalCacheEntry:
+    expires_at: float
+    size_bytes: int
+    payload: dict[str, Any]
+
+
+class _RetrievalCache:
+    """Bounded process-local cache for immutable retrieval responses."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        ttl_seconds: int,
+        max_entries: int,
+        max_bytes: int,
+    ) -> None:
+        self.enabled = enabled
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self._entries: OrderedDict[str, _RetrievalCacheEntry] = OrderedDict()
+        self._inflight: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._bytes = 0
+        self._generation = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    @staticmethod
+    def _size_bytes(payload: dict[str, Any]) -> int:
+        encoded = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), default=str
+        ).encode("utf-8")
+        return len(encoded)
+
+    def _purge_expired_locked(self, now: float) -> None:
+        expired = [
+            key
+            for key, entry in self._entries.items()
+            if entry.expires_at <= now
+        ]
+        for key in expired:
+            entry = self._entries.pop(key)
+            self._bytes -= entry.size_bytes
+
+    async def get(self, key: str) -> dict[str, Any] | None:
+        payload, _ = await self.get_with_age(key)
+        return payload
+
+    async def get_with_age(
+        self, key: str
+    ) -> tuple[dict[str, Any] | None, float | None]:
+        if not self.enabled:
+            return None, None
+        async with self._lock:
+            now = time.monotonic()
+            self._purge_expired_locked(now)
+            entry = self._entries.get(key)
+            if entry is None:
+                return None, None
+            self._entries.move_to_end(key)
+            age_seconds = max(0.0, self.ttl_seconds - max(0.0, entry.expires_at - now))
+            return copy.deepcopy(entry.payload), age_seconds
+
+    async def get_or_compute(
+        self,
+        key: str,
+        factory: Callable[[], Any],
+        *,
+        should_store: Callable[[Any], bool],
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            return await factory()
+
+        owner = False
+        async with self._lock:
+            self._purge_expired_locked(time.monotonic())
+            entry = self._entries.get(key)
+            if entry is not None:
+                self._entries.move_to_end(key)
+                return copy.deepcopy(entry.payload)
+            future = self._inflight.get(key)
+            if future is None:
+                future = asyncio.get_running_loop().create_future()
+                self._inflight[key] = future
+                owner = True
+
+        if not owner:
+            return copy.deepcopy(await asyncio.shield(future))
+
+        try:
+            value = await factory()
+            if should_store(value):
+                await self._put(key, value)
+            result = copy.deepcopy(value)
+            if not future.done():
+                future.set_result(copy.deepcopy(value))
+            return result
+        except BaseException as exc:
+            if not future.done():
+                if isinstance(exc, asyncio.CancelledError):
+                    future.cancel()
+                else:
+                    future.set_exception(exc)
+                    # Mark the exception as retrieved when no waiter exists.
+                    future.exception()
+            raise
+        finally:
+            async with self._lock:
+                if self._inflight.get(key) is future:
+                    self._inflight.pop(key, None)
+
+    async def _put(self, key: str, payload: dict[str, Any]) -> None:
+        value = copy.deepcopy(payload)
+        size_bytes = self._size_bytes(value)
+        if size_bytes > self.max_bytes:
+            return
+        async with self._lock:
+            self._purge_expired_locked(time.monotonic())
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self._bytes -= previous.size_bytes
+            while self._entries and (
+                len(self._entries) >= self.max_entries
+                or self._bytes + size_bytes > self.max_bytes
+            ):
+                _, evicted = self._entries.popitem(last=False)
+                self._bytes -= evicted.size_bytes
+            self._entries[key] = _RetrievalCacheEntry(
+                expires_at=time.monotonic() + self.ttl_seconds,
+                size_bytes=size_bytes,
+                payload=value,
+            )
+            self._bytes += size_bytes
+
+    async def bump_generation(self) -> None:
+        async with self._lock:
+            self._generation += 1
+            self._entries.clear()
+            self._bytes = 0
+
+    async def clear(self) -> None:
+        async with self._lock:
+            self._entries.clear()
+            self._bytes = 0
+
+
+retrieval_cache = _RetrievalCache(
+    enabled=settings.retrieval_cache_enabled,
+    ttl_seconds=settings.retrieval_cache_ttl_seconds,
+    max_entries=settings.retrieval_cache_max_entries,
+    max_bytes=settings.retrieval_cache_max_bytes,
+)
 client: LightRAGClient | None = None
 hybrid_retriever: HybridRetriever | None = None
 hybrid_retriever_lock = asyncio.Lock()
@@ -105,6 +268,7 @@ async def get_job_store() -> RagJobStore:
 async def close_gateway_resources() -> None:
     """Close lazy shared resources when the combined HTTP application stops."""
     global client, hybrid_retriever, registry, job_store
+    await retrieval_cache.clear()
     active_hybrid = hybrid_retriever
     active_registry = registry
     active_client = client
@@ -130,6 +294,37 @@ async def close_gateway_resources() -> None:
                 "rag_gateway_resource_close_failed",
                 error_type=result.__class__.__name__,
             )
+
+
+async def prewarm_gateway_resources() -> None:
+    """Open the LightRAG connection before the first user retrieval request."""
+    if not settings.gateway_prewarm_enabled:
+        return
+    started_at = time.perf_counter()
+    try:
+        await asyncio.wait_for(
+            get_client().request("GET", "/health"),
+            timeout=settings.gateway_prewarm_timeout_seconds,
+        )
+        if os.getenv("RAG_HYBRID_ENABLED", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            await get_hybrid_retriever()
+        log_event(
+            logger,
+            "rag_gateway_prewarm_completed",
+            duration_ms=round(elapsed_ms(started_at), 3),
+        )
+    except Exception as exc:
+        log_event(
+            logger,
+            "rag_gateway_prewarm_failed",
+            duration_ms=round(elapsed_ms(started_at), 3),
+            error_type=exc.__class__.__name__,
+        )
 
 
 def _task_response(job: RagJob) -> dict[str, Any]:
@@ -251,6 +446,57 @@ def _query_payload(
         "enable_rerank": enable_rerank,
         "include_chunk_content": include_chunk_content,
     }
+
+
+def _retrieval_cache_key(request_payload: dict[str, Any], mode: str) -> str:
+    material = {
+        "corpus_generation": retrieval_cache.generation,
+        "workspace": settings.workspace
+        or os.getenv("RAG_PRODUCTION_WORKSPACE", "default"),
+        "response_limits": {
+            "max_return_chars": settings.max_return_chars,
+            "max_field_chars": settings.max_field_chars,
+            "max_evidence_items": settings.max_evidence_items,
+        },
+        "request": {
+            **request_payload,
+            "mode": mode,
+        },
+        "hybrid": {
+            name: os.getenv(name, "").strip().lower()
+            for name in (
+                "RAG_HYBRID_ENABLED",
+                "RAG_HYBRID_POSTGRES_ENABLED",
+                "RAG_HYBRID_FTS_CONFIG",
+                "RAG_HYBRID_PER_CHANNEL_LIMIT",
+                "RAG_HYBRID_FINAL_LIMIT",
+                "RAG_HYBRID_RRF_K",
+                "RAG_HYBRID_RERANK_ENABLED",
+                "RAG_QUERY_REWRITE_ENABLED",
+                "RAG_QUERY_REWRITE_BASE_URL",
+                "RAG_QUERY_REWRITE_MODEL",
+                "RAG_QUERY_REWRITE_TIMEOUT_SECONDS",
+                "RERANK_BINDING_HOST",
+                "RERANK_MODEL",
+            )
+        },
+    }
+    encoded = json.dumps(
+        material, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cacheable_retrieval_result(payload: Any) -> bool:
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        return False
+    warnings = payload.get("warnings")
+    if not isinstance(warnings, list):
+        return True
+    return all(
+        str(warning).strip().lower() == "query_rewrite:not_configured"
+        for warning in warnings
+    )
 
 
 def _safe_configuration(payload: dict[str, Any]) -> dict[str, Any]:
@@ -415,22 +661,43 @@ async def rag_retrieve(
         enable_rerank,
         include_chunk_content=True,
     )
-    async with query_slots:
-        hybrid = await get_hybrid_retriever()
-        if hybrid.enabled:
-            payload = await hybrid.retrieve(
-                request_payload["query"],
-                top_k=request_payload["top_k"],
-                chunk_top_k=request_payload["chunk_top_k"],
-                max_total_tokens=request_payload["max_total_tokens"],
-                enable_rerank=request_payload["enable_rerank"],
-            )
-            payload["requested_mode"] = mode
-        else:
-            payload = await get_client().request(
-                "POST", "/query/data", json=request_payload
-            )
-    return get_client().bounded_payload(payload)
+    cache_key = _retrieval_cache_key(request_payload, mode)
+    cached, cache_age_seconds = await retrieval_cache.get_with_age(cache_key)
+    if cached is not None:
+        log_event(
+            logger,
+            "rag_retrieval_cache_hit",
+            cache_hit=True,
+            cache_age_ms=round((cache_age_seconds or 0.0) * 1000, 3),
+        )
+        return cached
+
+    async def retrieve() -> dict[str, Any]:
+        async with query_slots:
+            hybrid = await get_hybrid_retriever()
+            if hybrid.enabled:
+                payload = await hybrid.retrieve(
+                    request_payload["query"],
+                    top_k=request_payload["top_k"],
+                    chunk_top_k=request_payload["chunk_top_k"],
+                    max_total_tokens=request_payload["max_total_tokens"],
+                    enable_rerank=request_payload["enable_rerank"],
+                )
+                payload["requested_mode"] = mode
+            else:
+                payload = await get_client().request(
+                    "POST", "/query/data", json=request_payload
+                )
+        return get_client().bounded_payload(payload)
+
+    result = await retrieval_cache.get_or_compute(
+        cache_key,
+        retrieve,
+        should_store=_cacheable_retrieval_result,
+    )
+    if retrieval_cache.enabled:
+        log_event(logger, "rag_retrieval_cache_miss", cache_hit=False)
+    return result
 
 
 @mcp.tool(
@@ -569,6 +836,8 @@ async def rag_ingest(
             )
         except ValueError as exc:
             raise LightRAGError(str(exc)) from exc
+    if registration.disposition == "registered":
+        await retrieval_cache.bump_generation()
     return {
         "disposition": registration.disposition,
         "document_id": str(registration.document_id),
@@ -615,6 +884,7 @@ async def rag_cancel_task(
             task = await (await get_job_store()).cancel(parsed_task_id)
         except ValueError as exc:
             raise LightRAGError(str(exc)) from exc
+    await retrieval_cache.bump_generation()
     return _task_response(task)
 
 
@@ -632,6 +902,7 @@ async def rag_retry_task(
             task = await (await get_job_store()).retry(parsed_task_id)
         except ValueError as exc:
             raise LightRAGError(str(exc)) from exc
+    await retrieval_cache.bump_generation()
     return _task_response(task)
 
 
@@ -655,6 +926,7 @@ async def rag_recover_ingest(
             )
         except ValueError as exc:
             raise LightRAGError(str(exc)) from exc
+    await retrieval_cache.bump_generation()
     return _task_response(task)
 
 
@@ -695,6 +967,7 @@ async def rag_delete_documents(
             ]
         except ValueError as exc:
             raise LightRAGError(str(exc)) from exc
+    await retrieval_cache.bump_generation()
     return {"tasks": [_task_response(task) for task in tasks]}
 
 

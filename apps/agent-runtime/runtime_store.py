@@ -211,6 +211,19 @@ class DesktopStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_turn_performance_recent
                     ON turn_performance (updated_at DESC);
+                CREATE TABLE IF NOT EXISTS stream_checkpoints (
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT,
+                    stream_id TEXT NOT NULL,
+                    stream_seq INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'streaming',
+                    last_event_id INTEGER,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, stream_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_stream_checkpoints_status
+                    ON stream_checkpoints (session_id, status, updated_at);
                 """
             )
             columns = {
@@ -243,6 +256,46 @@ class DesktopStore:
         now = _now()
         recovered = 0
         with self._lock, self._connection() as connection:
+            checkpoint_rows = connection.execute(
+                "SELECT session_id, turn_id, stream_id, stream_seq, text "
+                "FROM stream_checkpoints WHERE status = ?",
+                ("streaming",),
+            ).fetchall()
+            checkpoint_sessions: set[str] = set()
+            for checkpoint in checkpoint_rows:
+                session_id = str(checkpoint["session_id"])
+                stream_id = str(checkpoint["stream_id"])
+                turn_id = checkpoint["turn_id"]
+                text = str(checkpoint["text"] or "")
+                if text:
+                    connection.execute(
+                        "INSERT INTO events (session_id, turn_id, event_type, payload, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            session_id,
+                            turn_id,
+                            "assistant.message",
+                            _json({
+                                "text": text,
+                                "delta": "",
+                                "phase": "final",
+                                "stream_id": stream_id,
+                                "stream_seq": int(checkpoint["stream_seq"]) + 1,
+                                "stream_done": True,
+                                "stream_recovered": True,
+                                "recovered": True,
+                                "durability": "durable",
+                            }),
+                            now,
+                        ),
+                    )
+                connection.execute(
+                    "UPDATE stream_checkpoints SET status = ?, updated_at = ? "
+                    "WHERE session_id = ? AND stream_id = ?",
+                    ("aborted", now, session_id, stream_id),
+                )
+                checkpoint_sessions.add(session_id)
+
             rows = connection.execute(
                 "SELECT turn_id, session_id FROM turns WHERE status = ?",
                 ("running",),
@@ -271,8 +324,8 @@ class DesktopStore:
                 )
                 recovered += 1
 
-            if rows:
-                session_ids = {str(row["session_id"]) for row in rows}
+            session_ids = {str(row["session_id"]) for row in rows} | checkpoint_sessions
+            if session_ids:
                 for session_id in session_ids:
                     has_queued = connection.execute(
                         "SELECT 1 FROM turns WHERE session_id = ? AND status = ? LIMIT 1",
@@ -740,6 +793,109 @@ class DesktopStore:
             self._history_cache_access.pop(session_id, None)
             self._history_generation[session_id] = self._history_generation.get(session_id, 0) + 1
             return int(cursor.lastrowid)
+
+    def append_event_batch(
+        self,
+        session_id: str,
+        events: list[tuple[str | None, str, dict[str, Any]]],
+        checkpoints: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Append streaming events and their latest checkpoints atomically."""
+        if not events and not checkpoints:
+            return []
+        persisted: list[dict[str, Any]] = []
+        now = _now()
+        with self._lock, self._connection() as connection:
+            for turn_id, event_type, payload in events:
+                created_at = _now()
+                cursor = connection.execute(
+                    "INSERT INTO events (session_id, turn_id, event_type, payload, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (session_id, turn_id, event_type, _json(payload), created_at),
+                )
+                persisted.append({
+                    "event_id": int(cursor.lastrowid),
+                    "turn_id": turn_id,
+                    "event_type": event_type,
+                    "payload": payload,
+                    "created_at": created_at,
+                })
+            last_event_by_stream: dict[str, int] = {}
+            for event in persisted:
+                stream_id = str(event["payload"].get("stream_id") or "")
+                if stream_id:
+                    last_event_by_stream[stream_id] = int(event["event_id"])
+            for checkpoint in checkpoints or []:
+                stream_id = str(checkpoint["stream_id"])
+                connection.execute(
+                    "INSERT INTO stream_checkpoints "
+                    "(session_id, turn_id, stream_id, stream_seq, text, status, last_event_id, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(session_id, stream_id) DO UPDATE SET "
+                    "turn_id=excluded.turn_id, stream_seq=excluded.stream_seq, text=excluded.text, "
+                    "status=excluded.status, last_event_id=excluded.last_event_id, updated_at=excluded.updated_at",
+                    (
+                        session_id,
+                        checkpoint.get("turn_id"),
+                        stream_id,
+                        int(checkpoint["stream_seq"]),
+                        str(checkpoint.get("text") or ""),
+                        str(checkpoint.get("status") or "streaming"),
+                        checkpoint.get("last_event_id") or last_event_by_stream.get(stream_id),
+                        float(checkpoint.get("updated_at") or now),
+                    ),
+                )
+            if events or checkpoints:
+                self._history_cache.pop(session_id, None)
+                self._history_cache_access.pop(session_id, None)
+                self._history_generation[session_id] = self._history_generation.get(session_id, 0) + 1
+        return persisted
+
+    def stream_checkpoints(self, session_id: str, *, status: str | None = None) -> list[dict[str, Any]]:
+        query = (
+            "SELECT session_id, turn_id, stream_id, stream_seq, text, status, last_event_id, updated_at "
+            "FROM stream_checkpoints WHERE session_id = ?"
+        )
+        params: list[Any] = [session_id]
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY updated_at ASC"
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_stream_checkpoint_status(
+        self,
+        session_id: str,
+        stream_id: str,
+        status: str,
+        *,
+        stream_seq: int | None = None,
+        text: str | None = None,
+        last_event_id: int | None = None,
+    ) -> None:
+        assignments = ["status = ?", "updated_at = ?"]
+        values: list[Any] = [status, _now()]
+        if stream_seq is not None:
+            assignments.append("stream_seq = ?")
+            values.append(stream_seq)
+        if text is not None:
+            assignments.append("text = ?")
+            values.append(text)
+        if last_event_id is not None:
+            assignments.append("last_event_id = ?")
+            values.append(last_event_id)
+        values.extend([session_id, stream_id])
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                f"UPDATE stream_checkpoints SET {', '.join(assignments)} "
+                "WHERE session_id = ? AND stream_id = ?",
+                values,
+            )
+            self._history_cache.pop(session_id, None)
+            self._history_cache_access.pop(session_id, None)
+            self._history_generation[session_id] = self._history_generation.get(session_id, 0) + 1
 
     def events_after(
         self,

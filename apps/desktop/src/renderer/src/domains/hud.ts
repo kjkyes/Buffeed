@@ -1,7 +1,7 @@
 import type { StreamEvent } from "./agent";
 
 export type HUDOperationKind = "command" | "edit" | "review" | "request" | "read" | "team" | "other";
-export type HUDOperationStatus = "running" | "completed" | "failed";
+export type HUDOperationStatus = "running" | "completed" | "failed" | "cancelled";
 export type HUDStepStatus = "pending" | "running" | "completed" | "failed";
 
 export type HUDStep = {
@@ -60,6 +60,20 @@ export type TaskHUDState = {
   phase: TaskHUDPhase;
   cancellationNote: boolean;
 };
+
+export function terminalPhase(events: StreamEvent[]): TaskHUDPhase | null {
+  const terminalEvent = [...events].reverse().find((event) => (
+    event.type === "turn.finished" || event.type === "turn.cancelled" || event.type === "turn.error"
+  ));
+  if (!terminalEvent) return null;
+  if (terminalEvent.type === "turn.cancelled" || terminalEvent.payload.status === "cancelled") {
+    return "cancelled";
+  }
+  if (terminalEvent.type === "turn.error" || terminalEvent.payload.status === "error") {
+    return "failed";
+  }
+  return "completed";
+}
 
 const MAX_DETAIL_LENGTH = 3_000;
 
@@ -223,16 +237,6 @@ export function deriveTaskHUD(
       cancellationNote = true;
       if (active) phase = "running";
     }
-    if (event.type === "turn.cancelled") {
-      phase = "cancelled";
-    }
-    if (event.type === "turn.error") {
-      phase = "failed";
-    }
-    if (event.type === "turn.finished") {
-      const status = text(event.payload.status);
-      phase = status === "cancelled" ? "cancelled" : status === "error" ? "failed" : "completed";
-    }
     const nextSteps = stepsFromEvent(event);
     if (nextSteps) steps = nextSteps;
     if (event.type === "tool.requested") {
@@ -303,10 +307,11 @@ export function deriveTaskHUD(
   const terminalEvent = [...events].reverse().find((event) => (
     event.type === "turn.finished" || event.type === "turn.cancelled" || event.type === "turn.error"
   ));
+  const terminal = terminalPhase(events);
   if (terminalEvent) {
-    const terminalStatus = terminalEvent.type === "turn.error" || terminalEvent.type === "turn.cancelled"
-      ? "failed"
-      : ["error", "cancelled"].includes(text(terminalEvent.payload.status))
+    const terminalStatus: HUDOperationStatus = terminal === "cancelled"
+      ? "cancelled"
+      : terminal === "failed"
         ? "failed"
         : "completed";
     const terminalDetail = terminalEvent.type === "turn.error"
@@ -327,9 +332,10 @@ export function deriveTaskHUD(
       ]));
       operation.detail = [operation.detail, terminalDetail].filter(Boolean).join("\n");
     }
+    phase = terminal ?? phase;
   }
 
-  if (!active && phase === "idle" && operations.length > 0) phase = "completed";
+  if (!terminal && operations.some((operation) => operation.status === "running")) phase = "running";
   const currentIndex = steps.findIndex((step) => ["running", "failed", "pending"].includes(step.status));
   const currentStep = steps.length === 0 ? 0 : currentIndex >= 0 ? currentIndex + 1 : steps.length;
   const summary = fileChanges.length > 0

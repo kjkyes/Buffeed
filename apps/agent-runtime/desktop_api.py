@@ -10,6 +10,7 @@ import json
 import logging
 import mimetypes
 import os
+import queue
 import re
 import sqlite3
 import shutil
@@ -86,6 +87,15 @@ MAX_INLINE_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_ATTACHMENT_PREVIEW_URL_CHARS = 750_000
 TEAM_CANCEL_REPORT_TIMEOUT_SECONDS = max(
     1.0, float(os.getenv("DESKTOP_TEAM_CANCEL_REPORT_TIMEOUT_SECONDS", "10"))
+)
+STREAM_CHECKPOINT_INTERVAL_SECONDS = max(
+    0.05, float(os.getenv("BUFFEED_STREAM_CHECKPOINT_INTERVAL_MS", "400")) / 1_000
+)
+STREAM_CHECKPOINT_MAX_CHARS = max(
+    1, int(os.getenv("BUFFEED_STREAM_CHECKPOINT_MAX_CHARS", "1024"))
+)
+STREAM_PERSIST_QUEUE_MAX_ITEMS = max(
+    32, int(os.getenv("BUFFEED_STREAM_PERSIST_QUEUE_MAX_ITEMS", "4096"))
 )
 # Team tools are available to the current turn. Member threads are suspended
 # at turn boundaries so an old Team cannot be reused by a later request.
@@ -755,8 +765,67 @@ class _LegacyDesktopStore:
 class EventBroker:
     store: DesktopStore
     session_id: str
-    _events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1024))
+    _events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=4096))
     _condition: threading.Condition = field(default_factory=threading.Condition)
+    _persist_queue: queue.Queue[dict[str, Any]] = field(
+        default_factory=lambda: queue.Queue(maxsize=STREAM_PERSIST_QUEUE_MAX_ITEMS),
+        init=False,
+    )
+    _worker: threading.Thread | None = field(default=None, init=False)
+    _stop_event: threading.Event = field(default_factory=threading.Event, init=False)
+    _flush_event: threading.Event = field(default_factory=threading.Event, init=False)
+    _inflight_batches: int = field(default=0, init=False)
+    _retry_batches: deque[list[dict[str, Any]]] = field(default_factory=deque, init=False)
+    _volatile_counter: int = field(default=0, init=False)
+    _stream_sequences: dict[str, int] = field(default_factory=dict, init=False)
+    _stream_text: dict[str, str] = field(default_factory=dict, init=False)
+    _stream_turn_ids: dict[str, str | None] = field(default_factory=dict, init=False)
+    _stream_checkpoint_at: dict[str, float] = field(default_factory=dict, init=False)
+    _stream_checkpoint_chars: dict[str, int] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        self._worker = threading.Thread(
+            target=self._persist_loop,
+            name=f"desktop-event-writer-{self.session_id[:8]}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @staticmethod
+    def _is_streaming(payload: dict[str, Any], event_type: str) -> bool:
+        return (
+            event_type == "assistant.message"
+            and str(payload.get("phase") or "") == "streaming"
+            and bool(str(payload.get("stream_id") or "").strip())
+        )
+
+    def _append_live_event(self, event: dict[str, Any]) -> None:
+        with self._condition:
+            self._events.append(event)
+            self._condition.notify_all()
+
+    def _publish_durable(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        turn_id: str | None,
+    ) -> dict[str, Any]:
+        durable_payload = dict(payload)
+        if event_type == "assistant.message" and payload.get("stream_id"):
+            durable_payload["durability"] = "durable"
+        event_id = self.store.append_event(
+            self.session_id, turn_id, event_type, durable_payload
+        )
+        event = {
+            "event_id": event_id,
+            "volatile_id": None,
+            "turn_id": turn_id,
+            "event_type": event_type,
+            "payload": durable_payload,
+            "created_at": _now(),
+        }
+        self._append_live_event(event)
+        return event
 
     def publish(
         self,
@@ -764,39 +833,305 @@ class EventBroker:
         payload: dict[str, Any],
         turn_id: str | None = None,
     ) -> dict[str, Any]:
-        event_id = self.store.append_event(
-            self.session_id, turn_id, event_type, payload
-        )
-        event = {
-            "event_id": event_id,
-            "turn_id": turn_id,
-            "event_type": event_type,
-            "payload": payload,
-            "created_at": _now(),
-        }
+        data = dict(payload)
+        stream_id = str(data.get("stream_id") or "").strip()
+        if not self._is_streaming(data, event_type):
+            self.flush()
+            if stream_id and event_type == "assistant.message":
+                sequence = self._stream_sequences.get(stream_id, 0) + 1
+                self._stream_sequences[stream_id] = sequence
+                data.setdefault("stream_seq", sequence)
+            event = self._publish_durable(event_type, data, turn_id)
+            if stream_id and str(data.get("phase") or "") != "streaming":
+                self.store.set_stream_checkpoint_status(
+                    self.session_id,
+                    stream_id,
+                    "completed" if data.get("stream_done") is True else "aborted",
+                    stream_seq=int(data.get("stream_seq") or self._stream_sequences.get(stream_id, 0)),
+                    text=str(data.get("text") or self._stream_text.get(stream_id, "")),
+                    last_event_id=int(event["event_id"]),
+                )
+                self._stream_text.pop(stream_id, None)
+                self._stream_turn_ids.pop(stream_id, None)
+                self._stream_sequences.pop(stream_id, None)
+                self._stream_checkpoint_at.pop(stream_id, None)
+                self._stream_checkpoint_chars.pop(stream_id, None)
+            return event
+
+        sequence = self._stream_sequences.get(stream_id, 0) + 1
+        self._stream_sequences[stream_id] = sequence
+        delta = str(data.get("delta") if data.get("delta") is not None else data.get("text") or "")
+        text = self._stream_text.get(stream_id, "") + delta
+        self._stream_text[stream_id] = text
+        self._stream_turn_ids[stream_id] = turn_id
+        data.update({
+            "stream_id": stream_id,
+            "stream_seq": sequence,
+            "durability": "volatile",
+        })
         with self._condition:
+            self._volatile_counter += 1
+            event = {
+                "event_id": None,
+                "volatile_id": self._volatile_counter,
+                "turn_id": turn_id,
+                "event_type": event_type,
+                "payload": data,
+                "created_at": _now(),
+            }
             self._events.append(event)
             self._condition.notify_all()
+        now = time.monotonic()
+        checkpoint_due = (
+            len(text) - self._stream_checkpoint_chars.get(stream_id, 0) >= STREAM_CHECKPOINT_MAX_CHARS
+            or now - self._stream_checkpoint_at.get(stream_id, now) >= STREAM_CHECKPOINT_INTERVAL_SECONDS
+        )
+        item = {
+            "event": event,
+            "checkpoint": {
+                "turn_id": turn_id,
+                "stream_id": stream_id,
+                "stream_seq": sequence,
+                "text": text,
+                "status": "streaming",
+                "checkpoint_due": checkpoint_due,
+            } if checkpoint_due else None,
+        }
+        if self._stop_event.is_set():
+            self._persist_direct(item)
+            return event
+        try:
+            self._persist_queue.put(item, timeout=0.25)
+        except queue.Full:
+            item["checkpoint"] = {
+                "turn_id": turn_id,
+                "stream_id": stream_id,
+                "stream_seq": sequence,
+                "text": text,
+                "status": "streaming",
+                "checkpoint_due": True,
+            }
+            try:
+                self.flush()
+                self._persist_queue.put(item)
+            except Exception:
+                # A failed writer must not drop the delta that was already
+                # broadcast; synchronously persist this item as a fallback.
+                self._persist_direct(item)
         return event
+
+    def _persist_direct(self, item: dict[str, Any]) -> None:
+        event = item["event"]
+        payload = dict(event["payload"])
+        payload["durability"] = "durable"
+        checkpoint = item.get("checkpoint")
+        persisted = self.store.append_event_batch(
+            self.session_id,
+            [(event["turn_id"], event["event_type"], payload)],
+            [checkpoint] if checkpoint else None,
+        )
+        for durable in persisted:
+            self._append_live_event({
+                "event_id": durable["event_id"],
+                "volatile_id": None,
+                "turn_id": durable["turn_id"],
+                "event_type": durable["event_type"],
+                "payload": durable["payload"],
+                "created_at": durable["created_at"],
+            })
+        if checkpoint:
+            stream_id = str(checkpoint["stream_id"])
+            self._stream_checkpoint_at[stream_id] = time.monotonic()
+            self._stream_checkpoint_chars[stream_id] = len(str(checkpoint["text"]))
+
+    def _persist_loop(self) -> None:
+        while (
+            not self._stop_event.is_set()
+            or not self._persist_queue.empty()
+            or bool(self._retry_batches)
+        ):
+            from_queue = False
+            with self._condition:
+                retry_batch = self._retry_batches.popleft() if self._retry_batches else None
+            if retry_batch is not None:
+                batch = retry_batch
+            else:
+                try:
+                    first = self._persist_queue.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                from_queue = True
+                batch = [first]
+            chars = len(str(batch[0]["event"]["payload"].get("delta") or ""))
+            deadline = time.monotonic() + STREAM_CHECKPOINT_INTERVAL_SECONDS
+            with self._condition:
+                self._inflight_batches += 1
+            try:
+                while from_queue and chars < STREAM_CHECKPOINT_MAX_CHARS and time.monotonic() < deadline:
+                    if self._flush_event.is_set():
+                        break
+                    try:
+                        item = self._persist_queue.get(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+                    except queue.Empty:
+                        continue
+                    batch.append(item)
+                    chars += len(str(item["event"]["payload"].get("delta") or ""))
+                events: list[tuple[str | None, str, dict[str, Any]]] = []
+                checkpoints: dict[str, dict[str, Any]] = {}
+                for item in batch:
+                    event = item["event"]
+                    payload = dict(event["payload"])
+                    payload["durability"] = "durable"
+                    events.append((event["turn_id"], event["event_type"], payload))
+                    checkpoint = item.get("checkpoint")
+                    if checkpoint and checkpoint.get("checkpoint_due"):
+                        checkpoints[str(checkpoint["stream_id"])] = checkpoint
+                persisted = self.store.append_event_batch(
+                    self.session_id,
+                    events,
+                    list(checkpoints.values()),
+                )
+                persisted_by_seq = {
+                    (
+                        str(event["payload"].get("stream_id") or ""),
+                        int(event["payload"].get("stream_seq") or 0),
+                    ): event
+                    for event in persisted
+                }
+                for stream_id, checkpoint in checkpoints.items():
+                    persisted_event = persisted_by_seq.get(
+                        (stream_id, int(checkpoint["stream_seq"]))
+                    )
+                    if persisted_event:
+                        checkpoint["last_event_id"] = persisted_event["event_id"]
+                for checkpoint in checkpoints.values():
+                    if checkpoint.get("last_event_id") is not None:
+                        self.store.set_stream_checkpoint_status(
+                            self.session_id,
+                            str(checkpoint["stream_id"]),
+                            "streaming",
+                            stream_seq=int(checkpoint["stream_seq"]),
+                            text=str(checkpoint["text"]),
+                            last_event_id=int(checkpoint["last_event_id"]),
+                        )
+                for event in persisted:
+                    durable_event = {
+                        "event_id": event["event_id"],
+                        "volatile_id": None,
+                        "turn_id": event["turn_id"],
+                        "event_type": event["event_type"],
+                        "payload": event["payload"],
+                        "created_at": event["created_at"],
+                    }
+                    self._append_live_event(durable_event)
+            except Exception:
+                LOGGER.exception("stream event persistence failed", extra={"session_id": self.session_id})
+                # Keep the batch outside the bounded queue so a full queue
+                # cannot deadlock the writer while preserving every delta.
+                with self._condition:
+                    self._retry_batches.append(batch)
+                time.sleep(0.05)
+            finally:
+                if from_queue:
+                    for _ in batch:
+                        self._persist_queue.task_done()
+                with self._condition:
+                    self._inflight_batches -= 1
+                    self._condition.notify_all()
+                for checkpoint in batch:
+                    snapshot = checkpoint.get("checkpoint")
+                    if snapshot and snapshot.get("checkpoint_due"):
+                        stream_id = str(snapshot["stream_id"])
+                        self._stream_checkpoint_at[stream_id] = time.monotonic()
+                        self._stream_checkpoint_chars[stream_id] = len(str(snapshot["text"]))
+                if self._persist_queue.empty():
+                    self._flush_event.clear()
+
+    def flush(self, timeout_seconds: float = 5.0) -> None:
+        self._flush_event.set()
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            while not self._persist_queue.empty() or self._inflight_batches or self._retry_batches:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("stream event persistence flush timed out")
+                self._condition.wait(min(0.05, remaining))
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        except Exception:
+            LOGGER.exception("stream event broker flush failed", extra={"session_id": self.session_id})
+        self._stop_event.set()
+        self._flush_event.set()
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=5)
 
     def wake(self) -> None:
         """Wake SSE consumers after an event was persisted without this broker."""
         with self._condition:
             self._condition.notify_all()
 
-    def wait_after(self, after: int, timeout_seconds: float) -> list[dict[str, Any]]:
+    def volatile_cursor(self) -> int:
         with self._condition:
-            matches = [event for event in self._events if event["event_id"] > after]
+            return self._volatile_counter
+
+    def wait_after(
+        self,
+        after: int,
+        volatile_after: int,
+        timeout_seconds: float,
+    ) -> list[dict[str, Any]]:
+        with self._condition:
+            matches = [
+                event for event in self._events
+                if (
+                    event["event_id"] is not None and event["event_id"] > after
+                ) or (
+                    event.get("volatile_id") is not None
+                    and event["volatile_id"] > volatile_after
+                )
+            ]
             if not matches:
                 self._condition.wait(timeout_seconds)
-                matches = [event for event in self._events if event["event_id"] > after]
+                matches = [
+                    event for event in self._events
+                    if (
+                        event["event_id"] is not None and event["event_id"] > after
+                    ) or (
+                        event.get("volatile_id") is not None
+                        and event["volatile_id"] > volatile_after
+                    )
+                ]
         # The in-memory deque is only a wake-up accelerator. A reconnect or a
         # slow consumer can fall behind its bounded window, so always reconcile
         # with SQLite before returning a batch.
         durable = self.store.events_after(self.session_id, after)
-        by_id = {event["event_id"]: event for event in durable}
-        by_id.update({event["event_id"]: event for event in matches})
-        return [by_id[event_id] for event_id in sorted(by_id)]
+
+        def stream_key(event: dict[str, Any]) -> tuple[str, int] | None:
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                return None
+            stream_id = str(payload.get("stream_id") or "").strip()
+            try:
+                stream_seq = int(payload.get("stream_seq"))
+            except (TypeError, ValueError):
+                return None
+            return (stream_id, stream_seq) if stream_id and stream_seq > 0 else None
+
+        # Durable events are the cursor-bearing source of truth. A volatile
+        # delta is only needed when its durable counterpart has not reached
+        # SQLite yet; terminal events have no volatile counterpart and must
+        # therefore remain in the returned durable batch.
+        durable_stream_keys = {
+            key for event in durable if (key := stream_key(event)) is not None
+        }
+        volatile_only = [
+            event for event in matches
+            if event.get("event_id") is None
+            and stream_key(event) not in durable_stream_keys
+        ]
+        return durable + volatile_only
 
 
 @dataclass
@@ -1890,6 +2225,7 @@ class SessionRuntime:
         reasoning_effort: str | None,
     ) -> None:
         self._mark_turn_worker_started(turn_id)
+        terminal_event_emitted = False
 
         def emit(event_type: str, payload: dict[str, Any]) -> None:
             self.publish(event_type, payload, turn_id)
@@ -1943,6 +2279,7 @@ class SessionRuntime:
             if callable(suspend_members):
                 suspend_members("turn_finished")
             self.publish("turn.finished", result, turn_id)
+            terminal_event_emitted = True
         except Exception as exc:
             turn_status = "error"
             self.manager.store.set_turn_status(turn_id, "error")
@@ -1950,13 +2287,41 @@ class SessionRuntime:
             suspend_members = getattr(self.Buffeed, "cancel_active_teammates", None)
             if callable(suspend_members):
                 suspend_members("turn_error")
-            self.publish(
-                "turn.error",
-                {"error_type": type(exc).__name__, "message": str(exc)},
-                turn_id,
-            )
+            try:
+                self.publish(
+                    "turn.error",
+                    {"error_type": type(exc).__name__, "message": str(exc)},
+                    turn_id,
+                )
+                terminal_event_emitted = True
+            except Exception:
+                # A persistence/SSE observer failure must not strand the turn
+                # without a durable terminal marker. The finalizer below gets
+                # one last chance to publish a minimal error event.
+                LOGGER.exception(
+                    "turn error event publish failed",
+                    extra={"session_id": self.session_id, "turn_id": turn_id},
+                )
             self._clear_turn_performance(turn_id)
         finally:
+            if not terminal_event_emitted:
+                fallback_type = "turn.cancelled" if turn_status == "cancelled" else "turn.error"
+                fallback_payload = (
+                    {"status": "cancelled", "recovered": True}
+                    if fallback_type == "turn.cancelled"
+                    else {
+                        "error_type": "TerminalEventPublishError",
+                        "message": "回合已结束，但终态事件首次发布失败，已由运行时补发。",
+                        "recovered": True,
+                    }
+                )
+                try:
+                    self.publish(fallback_type, fallback_payload, turn_id)
+                except Exception:
+                    LOGGER.exception(
+                        "turn terminal fallback publish failed",
+                        extra={"session_id": self.session_id, "turn_id": turn_id},
+                    )
             if turn_status in {"cancelled", "error"}:
                 self._fail_pending_steers(turn_id, turn_status)
             else:
@@ -2087,7 +2452,6 @@ class DesktopManager:
         self._runtime_restore_errors: dict[str, str] = {}
         self._turn_dispatch_threads: dict[str, threading.Thread] = {}
         self._turn_dispatch_requested: set[str] = set()
-        self._full_history_targets: set[str] = set()
 
     @staticmethod
     def _project_key(workspace: Path) -> str:
@@ -2208,8 +2572,9 @@ class DesktopManager:
         return "cold"
 
     def history_mode(self, session_id: str) -> str:
-        with self._lock:
-            return "full" if session_id in self._full_history_targets else "window"
+        # The desktop UX always restores complete history; prewarming only
+        # affects latency and does not change what a session can display.
+        return "full"
 
     def warm_session(self, session_id: str) -> str:
         status = self.runtime_status(session_id)
@@ -2257,8 +2622,6 @@ class DesktopManager:
     def prewarm_recent_sessions(self) -> None:
         """Restore the sessions most likely to receive the next desktop request."""
         if WARM_SESSION_COUNT == 0:
-            with self._lock:
-                self._full_history_targets.clear()
             return
 
         sessions = self.store.list_sessions()
@@ -2269,18 +2632,11 @@ class DesktopManager:
                 -float(session.get("updated_at") or 0),
             ),
         )[:WARM_SESSION_COUNT]
-        with self._lock:
-            self._full_history_targets = {
-                str(session["session_id"])
-                for session in prioritized
-            }
-
         def prewarm() -> None:
             for session in prioritized:
                 session_id = str(session["session_id"])
                 try:
-                    # Hot sessions keep a folded full-history cache so the
-                    # renderer can restore every historical turn immediately.
+                    # Prewarm the cache and runtime without changing history semantics.
                     self.store.history_events_after(session_id, 0, summary=True)
                     self.warm_session(session_id)
                 except Exception as exc:
@@ -2331,10 +2687,14 @@ class DesktopManager:
     def _shutdown_runtime(runtime: SessionRuntime) -> None:
         runtime.cancel_event.set()
         runtime.approvals.cancel_all()
+        turn_thread = runtime.turn_thread
+        if turn_thread is not None and turn_thread is not threading.current_thread():
+            turn_thread.join(timeout=2)
         try:
             runtime.Buffeed.shutdown_mcp_clients()
         except Exception:
             pass
+        runtime.broker.close()
 
     def _cache_runtime(self, session_id: str, runtime: SessionRuntime) -> None:
         evicted: list[SessionRuntime] = []
@@ -2494,6 +2854,8 @@ class DesktopManager:
             "turn.cancelled",
             {"status": "cancelled", "queued": True},
         )
+        if runtime is not None:
+            runtime.broker.wake()
         if not self.store.queued_turns(session_id):
             self.store.set_session_status(session_id, "idle")
         return True
@@ -3462,6 +3824,12 @@ async def stream_events(
     async def event_stream():
         started_at = time.perf_counter()
         cursor = cursor_after
+        initial_runtime = manager.get_cached_runtime(session_id)
+        volatile_cursor = (
+            initial_runtime.broker.volatile_cursor()
+            if initial_runtime is not None
+            else 0
+        )
         persisted = await asyncio.to_thread(
             store.history_events_after if (cursor == 0 and full_history) else store.events_after,
             session_id,
@@ -3483,12 +3851,22 @@ async def stream_events(
                 await asyncio.sleep(0.5)
                 events = await asyncio.to_thread(store.events_after, session_id, cursor)
             else:
-                events = await asyncio.to_thread(runtime.broker.wait_after, cursor, 15.0)
+                events = await asyncio.to_thread(
+                    runtime.broker.wait_after,
+                    cursor,
+                    volatile_cursor,
+                    15.0,
+                )
             if not events:
                 yield ": keepalive\n\n"
                 continue
             for event in events:
-                cursor = event["event_id"]
+                event_id = event.get("event_id")
+                volatile_id = event.get("volatile_id")
+                if event_id is not None:
+                    cursor = int(event_id)
+                if volatile_id is not None:
+                    volatile_cursor = max(volatile_cursor, int(volatile_id))
                 yield _format_sse(event)
 
     return StreamingResponse(
@@ -3535,8 +3913,10 @@ def _format_sse(event: dict[str, Any]) -> str:
         "payload": event["payload"],
         "created_at": event["created_at"],
     }
+    event_id = event.get("event_id")
+    id_line = f"id: {event_id}\n" if event_id is not None else ""
     return (
-        f"id: {event['event_id']}\n"
+        f"{id_line}"
         f"event: {event['event_type']}\n"
         f"data: {_json(payload)}\n\n"
     )

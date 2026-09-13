@@ -38,6 +38,12 @@ function teamOperationFamily(toolName: string): "spawn" | "message" | "task" | "
 
 function operationTitle(operation: HUDOperation, batchSize = 1): string {
   const subject = compactSubject(operation);
+  if (operation.status === "cancelled") {
+    return batchSize > 1 ? `${batchSize} 个操作已取消` : `已取消 '${subject}'`;
+  }
+  if (operation.status === "failed") {
+    return batchSize > 1 ? `${batchSize} 个操作失败` : `执行失败 '${subject}'`;
+  }
   if (operation.toolName === "todo_write") {
     return operation.status === "running"
       ? `正在更新 ${operation.stepCount ?? 0} 个 todos`
@@ -98,7 +104,10 @@ function operationEntryTitle(operation: HUDOperation): string {
   return operation.path ?? operation.command ?? operation.toolName;
 }
 
-export function groupAdjacentOperations(operations: HUDOperation[]): HUDOperation[][] {
+export function groupAdjacentOperations(
+  operations: HUDOperation[],
+  shouldBreak?: (previous: HUDOperation, current: HUDOperation) => boolean,
+): HUDOperation[][] {
   const groups: HUDOperation[][] = [];
   for (const operation of operations) {
     const previous = groups.at(-1);
@@ -115,7 +124,7 @@ export function groupAdjacentOperations(operations: HUDOperation[]): HUDOperatio
       : operation.kind === "other"
         ? `other:${operation.toolName}`
         : operation.kind;
-    if (previous && previousKey === operationKey) {
+    if (previous && previousOperation && previousKey === operationKey && !shouldBreak?.(previousOperation, operation)) {
       previous.push(operation);
     } else {
       groups.push([operation]);
@@ -204,6 +213,7 @@ export function AgentOperationCard({ operations, baseUrl, sessionId }: AgentOper
   const first = operations[0];
   const running = operations.some((operation) => operation.status === "running");
   const failed = operations.some((operation) => operation.status === "failed");
+  const cancelled = operations.some((operation) => operation.status === "cancelled");
   const title = operationTitle(first, operations.length);
 
   const loadDetail = async (operation: HUDOperation): Promise<void> => {
@@ -240,7 +250,7 @@ export function AgentOperationCard({ operations, baseUrl, sessionId }: AgentOper
   };
 
   return (
-    <article className={`trace-operation-card status-${running ? "running" : failed ? "failed" : "completed"}`}>
+    <article className={`trace-operation-card status-${running ? "running" : failed ? "failed" : cancelled ? "cancelled" : "completed"}`}>
       <button className="trace-operation-toggle" type="button" aria-expanded={open} onClick={toggle}>
         <span className="trace-operation-icon">{operationIcon(first.kind)}</span>
         <span className="trace-operation-title">{title}</span>

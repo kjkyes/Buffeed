@@ -29,11 +29,32 @@ function snapshotFromEvent(event: StreamEvent): ChangeSnapshot | null {
     return null;
   }
   const snapshot = value as Partial<ChangeSnapshot>;
-  return snapshot.attribution === "agent_tool"
-    && snapshot.turn_id === event.turnId
-    && Array.isArray(snapshot.files)
-    ? snapshot as ChangeSnapshot
-    : null;
+  // Older terminal events predate attribution/turn_id in the embedded
+  // snapshot. The terminal event itself is the authoritative turn boundary.
+  if (
+    !Array.isArray(snapshot.files)
+    || (snapshot.attribution !== undefined && snapshot.attribution !== "agent_tool")
+    || (snapshot.turn_id !== undefined && snapshot.turn_id !== null && snapshot.turn_id !== event.turnId)
+  ) {
+    return null;
+  }
+  return {
+    ...snapshot,
+    attribution: "agent_tool",
+    turn_id: event.turnId,
+    files: snapshot.files,
+  } as ChangeSnapshot;
+}
+
+function terminalSnapshot(events: StreamEvent[], turnId: string): ChangeFile[] | null {
+  for (const event of [...events].reverse()) {
+    if (event.turnId !== turnId || !["turn.finished", "turn.cancelled", "turn.error"].includes(event.type)) {
+      continue;
+    }
+    const snapshot = snapshotFromEvent(event);
+    if (snapshot) return snapshot.files;
+  }
+  return null;
 }
 
 export function useTaskHUD({
@@ -187,7 +208,9 @@ export function useTaskHUD({
     }
     const result: Record<string, TaskHUDState> = {};
     for (const [turnId, turnEvents] of eventsByTurn) {
-      const changes = fileChangesByTurn[turnId] ?? (turnId === activeTurnId ? fileChanges : []);
+      const changes = terminalSnapshot(turnEvents, turnId)
+        ?? fileChangesByTurn[turnId]
+        ?? (turnId === activeTurnId ? fileChanges : []);
       const state = deriveTaskHUD(turnEvents, changes, turnId === activeTurnId);
       if (state.summary) {
         result[turnId] = state;

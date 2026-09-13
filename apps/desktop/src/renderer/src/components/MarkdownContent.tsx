@@ -1,4 +1,5 @@
 import ReactMarkdown from "react-markdown";
+import { memo } from "react";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -20,7 +21,7 @@ function CodeBlock({ code, language }: { code: string; language: string }) {
   );
 }
 
-export function MarkdownContent({ text }: { text: string }) {
+export const MarkdownContent = memo(function MarkdownContent({ text }: { text: string }) {
   return (
     <div className="markdown-content">
       <ReactMarkdown
@@ -52,4 +53,4 @@ export function MarkdownContent({ text }: { text: string }) {
       </ReactMarkdown>
     </div>
   );
-}
+});
