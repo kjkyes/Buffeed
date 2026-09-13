@@ -58,6 +58,21 @@ Buffeed 将对话式 Agent、项目文件、工具执行和私有知识检索连
 评测集包含 35 条基础问答、15 条来源引用和 10 条无答案拒答样本。查看 [评测数据集](apps/rag/evals/cases.jsonl) 与 [完整评测报告](apps/rag/evals/report.json) 以复核指标口径和明细。
 相关的法律文件可通过[国家法律法规数据库](https://flk.npc.gov.cn/search)的法律条目查找。
 
+### 更快的响应与更流畅的流式体验
+
+针对真实使用中的等待和阅读体验，Buffeed 优化了首响应链路、流式事件传输和首屏渲染。基于冷会话、热会话短回答、热会话长回答三类场景（各 10 次平均），首响应与绘制延迟显著降低，持续输出速度同步提升。
+
+| 指标 | 冷会话 | 热会话（短回答） | 热会话（长回答） |
+| --- | ---: | ---: | ---: |
+| 模型 TTFT（ms） | 10079.30 → 4095.73<br>↓59.36% | 5164.39 → 1818.42<br>↓64.79% | 7187.11 → 2936.04<br>↓59.15% |
+| 用户端首个流式到达（ms） | 10148.95 → 4163.69<br>↓58.97% | 5231.36 → 1893.28<br>↓63.81% | 7260.23 → 3012.72<br>↓58.50% |
+| 首次绘制（ms） | 10287.50 → 4216.40<br>↓59.01% | 8426.20 → 1948.00<br>↓76.88% | 7579.70 → 3067.40<br>↓59.53% |
+| SSE 到绘制耗时（ms） | 109.30 → 24.00<br>↓78.04% | 235.30 → 34.90<br>↓85.17% | 224.00 → 32.30<br>↓85.58% |
+| 精确吐 token（token/s） | 32.31 → 40.55<br>↑25.50% | 63.78 → 681.74<br>↑968.89% | 46.49 → 62.43<br>↑34.29% |
+| 字符吐出速度（字符/s） | 51.69 → 74.34<br>↑43.82% | 347.44 → 394.69<br>↑13.60% | 67.04 → 99.12<br>↑47.85% |
+
+> 单元格格式为“基线 → 优化后”，↓ 表示耗时降低，↑ 表示吞吐提升。基线与优化后均为三种场景各 10 次的平均值；吞吐指标仅在单次模型响应且 usage 完整时统计。短回答的精确吐 token 提升受基线值较低影响。
+
 ### 以多模态上下文开始工作
 
 文件、文件夹、剪贴板图片、音频、视频和既有会话都可以成为任务上下文。工作台内置 Markdown、Mermaid、PDF、Word、演示文稿、表格、图片和视频预览，让材料与结果在同一处流转。
@@ -103,7 +118,11 @@ $env:BUFFEED_HOME="D:\buffeed_data\.buffeed"
 
 - `MODEL_ID`、`ANTHROPIC_API_KEY`：主 Agent 模型
 - `FALLBACK_MODEL_ID`：备用模型
-- `DASHSCOPE_API_KEY`：视频模型
+- `DASHSCOPE_API_KEY`：DashScope 文本/视频模型
+- `BUFFEED_DASHSCOPE_MAX_CONNECTIONS`、`BUFFEED_DASHSCOPE_MAX_KEEPALIVE`：DashScope 连接池上限
+- `BUFFEED_ANTHROPIC_MAX_IN_FLIGHT`、`BUFFEED_DASHSCOPE_MAX_IN_FLIGHT`：Provider 模型请求并发上限
+- `BUFFEED_TEAM_MAX_MEMBERS`：运行时 Team 成员上限
+- `BUFFEED_MODEL_SLOT_WAIT_SECONDS`：模型并发槽位最长排队时间
 - `COS_SECRET_ID`、`COS_SECRET_KEY`、`COS_REGION`、`COS_BUCKET`：视频上传 COS
 - `MCP_CONFIG_PATH`：自定义 MCP 配置
 - `DESKTOP_PYTHON`：指定 Python 解释器
